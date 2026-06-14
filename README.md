@@ -32,10 +32,49 @@ Remove the optional bundle without touching historical stats data:
 .\Remove-DreamersMcpCopilot.ps1
 ```
 
+## Optional Codex bundle
+
+Base `dreamers-codex` installs do not include stats hooks, Dreamers MCP registration, or local `dreamers-mcp` runtime files.
+
+To opt into Codex stats and the shared Dreamers stats MCP server, install the optional bundle from this repo into a Codex home:
+
+Linux:
+
+```bash
+./Install-DreamersMcpCodex.sh
+```
+
+Windows:
+
+```powershell
+.\Install-DreamersMcpCodex.ps1
+```
+
+Options:
+- `--codex-home /tmp/codex-home` or `-CodexHome "D:\custom\.codex"` to target a non-default Codex home
+- `--dreamers-mcp-path /path/to/dreamers-mcp` or `-DreamersMcpPath "D:\projects\dreamers-mcp"` to copy the runtime from another local checkout
+- `--force` or `-Force` to overwrite existing bundle-managed files
+
+The installer copies the shared runtime into `dreamers/runtime/dreamers_stats/`, installs the Codex compatibility shim and MCP server launcher into `dreamers/scripts/`, merges managed Dreamers hook handlers into `hooks.json`, and appends a managed Dreamers MCP block to `config.toml`. If an existing `hooks.json` or `config.toml` is not safe to merge automatically, the installer leaves that file unchanged and prints exact manual registration snippets.
+
+Remove the optional bundle without touching historical stats data:
+
+Linux:
+
+```bash
+./Remove-DreamersMcpCodex.sh
+```
+
+Windows:
+
+```powershell
+.\Remove-DreamersMcpCodex.ps1
+```
+
 ## Validation
 
 ```bash
-python3 -m py_compile dreamers_stats/*.py
+python3 -m py_compile dreamers_stats/*.py bundles/copilot/scripts/dreamers_stats.py bundles/codex/scripts/*.py tests/bundle_test_support.py tests/test_copilot_bundle.py tests/test_codex_bundle.py tests/test_shared_stats.py
 python3 -m unittest discover -s tests
 ```
 
@@ -45,6 +84,7 @@ python3 -m unittest discover -s tests
 python3 -m dreamers_stats doctor --client copilot --home /tmp/copilot-home --json
 python3 -m dreamers_stats summarize --client codex --home /tmp/codex-home --json
 python3 -m dreamers_stats hook --client copilot --home /tmp/copilot-home --event-name sessionStart < payload.json
+python3 -m dreamers_stats hook --client codex --home /tmp/codex-home --event-name UserPromptSubmit < payload.json
 ```
 
 Compatibility aliases remain available for current Copilot callers:

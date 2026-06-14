@@ -172,9 +172,11 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         event_id = runtime.record_event(event, client=client, home=home)
         return tool_success({"event_id": event_id})
     if name == "record_hook":
-        event = runtime.build_hook_event(arguments["event_name"], arguments["payload"])
-        event_id = runtime.record_event(event, client=client, home=home)
-        return tool_success({"event_id": event_id})
+        event_ids = [
+            runtime.record_event(event, client=client, home=home)
+            for event in runtime.build_hook_events(arguments["event_name"], arguments["payload"])
+        ]
+        return tool_success({"event_id": event_ids[0], "event_ids": event_ids})
     raise runtime.StatsValidationError("invalid_tool", "tool is not supported")
 
 

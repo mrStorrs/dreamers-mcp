@@ -16,12 +16,23 @@ from dreamers_stats.cli import main as cli_main
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COPILOT_INSTALLER_PATH = REPO_ROOT / "Install-DreamersMcpCopilot.ps1"
 COPILOT_REMOVER_PATH = REPO_ROOT / "Remove-DreamersMcpCopilot.ps1"
+CODEX_BASH_INSTALLER_PATH = REPO_ROOT / "Install-DreamersMcpCodex.sh"
+CODEX_BASH_REMOVER_PATH = REPO_ROOT / "Remove-DreamersMcpCodex.sh"
+CODEX_POWERSHELL_INSTALLER_PATH = REPO_ROOT / "Install-DreamersMcpCodex.ps1"
+CODEX_POWERSHELL_REMOVER_PATH = REPO_ROOT / "Remove-DreamersMcpCodex.ps1"
 COPILOT_BASH_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.sh"
 COPILOT_POWERSHELL_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.ps1"
 COPILOT_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_stats.py"
 COPILOT_HOOK_CONFIG_RELATIVE = Path("hooks") / "dreamers-stats.json"
 INSTALLED_RUNTIME_PACKAGE_RELATIVE = Path("dreamers") / "runtime" / "dreamers_stats"
 RUNTIME_INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "runtime-hooks.txt"
+CODEX_BASH_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.sh"
+CODEX_POWERSHELL_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.ps1"
+CODEX_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_stats.py"
+CODEX_MCP_SERVER_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_mcp_server.py"
+CODEX_INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "codex-bundle.json"
+CODEX_HOOKS_CONFIG_RELATIVE = Path("hooks.json")
+CODEX_MCP_CONFIG_RELATIVE = Path("config.toml")
 
 
 def valid_event(**overrides):
@@ -122,6 +133,17 @@ class BundleTestCase(unittest.TestCase):
 
     def run_shell_script(self, script_path, *args, input_text="", env=None, cwd=None):
         command = ["bash", str(script_path), *args]
+        return subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            cwd=REPO_ROOT if cwd is None else cwd,
+            env=env,
+        )
+
+    def run_subprocess(self, command, *, input_text="", env=None, cwd=None):
         return subprocess.run(
             command,
             input=input_text,
