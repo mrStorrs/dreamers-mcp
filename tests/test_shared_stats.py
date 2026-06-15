@@ -153,6 +153,22 @@ class SharedStatsTests(unittest.TestCase):
                 handle.write(line)
                 handle.write("\n")
 
+    def write_codex_session_lines(self, session_id, lines, *, home=None):
+        session_path = (
+            (home or self.codex_home)
+            / "sessions"
+            / "2026"
+            / "06"
+            / "15"
+            / f"rollout-2026-06-15T00-00-00-{session_id}.jsonl"
+        )
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        with session_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for line in lines:
+                handle.write(json.dumps(line))
+                handle.write("\n")
+        return session_path
+
     def write_review_artifact(self, repo_path, name, body):
         artifact_path = repo_path / ".dreamers" / "reviews" / name
         artifact_path.write_text(body, encoding="utf-8")
@@ -376,6 +392,214 @@ class SharedStatsTests(unittest.TestCase):
         report = json.loads(stdout)
         self.assertEqual(0, report["exact"]["row_count"])
         self.assertEqual(1, report["unavailable"]["row_count"])
+
+    def test_codex_stop_hook_records_exact_tokens_from_session_log(self):
+        self.write_codex_session_lines(
+            "session_exact",
+            [
+                {
+                    "timestamp": "2026-06-15T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_prompt", "text": "secret prompt text"},
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 125,
+                                "output_tokens": 22,
+                                "total_tokens": 222,
+                            }
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "assistant_message", "message": "secret assistant text"},
+                },
+            ],
+        )
+
+        code, stdout, stderr = self.invoke_hook(
+            "Stop",
+            {
+                "cwd": str(self.fixture_repo),
+                "timestamp": 1_781_483_620_000,
+                "session_id": "session_exact",
+                "last_assistant_message": "do not store stop text",
+                "stop_hook_active": False,
+            },
+            "--client",
+            "codex",
+            "--home",
+            str(self.codex_home),
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        stored = self.read_events(self.codex_events)
+        token_events = [event for event in stored if event["event_type"] == "token_usage_recorded"]
+        self.assertEqual(1, len(token_events))
+        token_metrics = token_events[0]["metrics"]
+        self.assertEqual("exact", token_metrics["token_source"])
+        self.assertEqual("turn", token_metrics["attribution_scope"])
+        self.assertEqual(200, token_metrics["input_tokens"])
+        self.assertEqual(22, token_metrics["output_tokens"])
+        self.assertEqual(222, token_metrics["total_tokens"])
+        self.assertEqual(125, token_metrics["cache_read_tokens"])
+        self.assertEqual(0, token_metrics["cache_write_tokens"])
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "codex", "--home", str(self.codex_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(1, report["exact"]["row_count"])
+        self.assertEqual(0, report["unavailable"]["row_count"])
+        self.assertEqual(222, report["exact"]["totals"]["total_tokens"])
+
+        code, stdout, stderr = self.invoke(
+            ["summarize", "--client", "codex", "--home", str(self.codex_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        summary = json.loads(stdout)
+        self.assertEqual(222, summary["tokens"]["exact"]["totals"]["total_tokens"])
+        self.assertEqual(0, summary["tokens"]["unavailable"]["row_count"])
+
+        raw_line = self.codex_events.read_text(encoding="utf-8")
+        self.assertNotIn("secret prompt text", raw_line)
+        self.assertNotIn("secret assistant text", raw_line)
+        self.assertNotIn("do not store", raw_line)
+
+    def test_codex_stop_hook_ignores_overlapping_session_filename_matches(self):
+        session_dir = self.codex_home / "sessions" / "2026" / "06" / "15"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        wrong_path = session_dir / "rollout-2026-06-15T00-00-00-session_overlap_extra.jsonl"
+        correct_path = session_dir / "rollout-2026-06-15T00-00-00-session_overlap.jsonl"
+        wrong_path.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"last_token_usage": {"input_tokens": 900, "output_tokens": 99, "total_tokens": 999}},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        correct_path.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"last_token_usage": {"input_tokens": 100, "output_tokens": 23, "total_tokens": 123}},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.utime(correct_path, (1_718_302_400, 1_718_302_400))
+        os.utime(wrong_path, (1_718_302_500, 1_718_302_500))
+
+        code, stdout, stderr = self.invoke_hook(
+            "Stop",
+            {
+                "cwd": str(self.fixture_repo),
+                "timestamp": 1_718_302_520_000,
+                "session_id": "session_overlap",
+                "stop_hook_active": False,
+            },
+            "--client",
+            "codex",
+            "--home",
+            str(self.codex_home),
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        stored = self.read_events(self.codex_events)
+        token_events = [event for event in stored if event["event_type"] == "token_usage_recorded"]
+        self.assertEqual(1, len(token_events))
+        self.assertEqual(123, token_events[0]["metrics"]["total_tokens"])
+
+    def test_codex_reports_resolve_unavailable_tokens_from_session_log(self):
+        self.write_codex_session_lines(
+            "session_report",
+            [
+                {
+                    "timestamp": "2026-06-15T00:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 80,
+                                "cached_input_tokens": 40,
+                                "output_tokens": 20,
+                                "total_tokens": 100,
+                            }
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:10Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 900,
+                                "cached_input_tokens": 800,
+                                "output_tokens": 99,
+                                "total_tokens": 999,
+                            }
+                        },
+                    },
+                },
+            ],
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_report_unavailable_tokens",
+                timestamp="2026-06-15T00:00:05Z",
+                session_id="session_report",
+                source="summary",
+                metrics={"token_source": "unavailable", "attribution_scope": "turn"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "codex", "--home", str(self.codex_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(1, report["exact"]["row_count"])
+        self.assertEqual(0, report["unavailable"]["row_count"])
+        self.assertEqual(100, report["exact"]["totals"]["total_tokens"])
+        self.assertEqual(40, report["exact"]["totals"]["cache_read_tokens"])
+        raw_line = self.codex_events.read_text(encoding="utf-8")
+        self.assertIn('"token_source":"unavailable"', raw_line)
 
     def test_codex_hook_events_accept_docs_shaped_payloads_without_timestamp(self):
         before = datetime.now(tz=UTC)
@@ -741,6 +965,30 @@ class SharedStatsTests(unittest.TestCase):
         self.assertIn(f"current_repo={self.fixture_repo}", stdout)
         self.assertIn("no runs matched these filters", stdout)
         self.assertIn("no validation attempts matched these filters", stdout)
+
+    def test_dashboard_token_card_marks_unavailable_totals_as_na(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_dashboard_unavailable_tokens",
+                timestamp="2026-06-13T10:00:00Z",
+                session_id="sess_unavailable",
+                source="summary",
+                metrics={"token_source": "unavailable", "attribution_scope": "turn"},
+            )
+        )
+        report = runtime.run_report(
+            "summarize",
+            client="copilot",
+            home=self.copilot_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        html_text = runtime.render_dashboard_html(report, client="copilot", generated_at="2026-06-15T00:00:00Z")
+
+        self.assertIn("<span>Tokens</span><strong>n/a</strong><small>unavailable</small>", html_text)
+        self.assertNotIn("<span>Tokens</span><strong>0</strong><small>exact total</small>", html_text)
 
     def test_dashboard_renderer_escapes_report_values(self):
         self.record_fixture_event(
