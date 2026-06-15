@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import hashlib
+import html
 import json
 import os
 import re
@@ -1820,6 +1821,7 @@ def report_filters_public(filters: dict[str, Any]) -> dict[str, Any]:
         "skill": filters["skill"],
         "since": filters["since"],
         "until": filters["until"],
+        "current_repo": filters["current_repo"],
     }
 
 
@@ -1919,8 +1921,205 @@ def format_summary_block_from_tokens(report: dict[str, Any]) -> list[str]:
     return [f"- exact total {report['exact']['totals']['total_tokens']}"]
 
 
+def html_text(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def html_count(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return html_text(value)
+
+
+def html_metric_card(label: str, value: Any, detail: str) -> str:
+    return (
+        '<section class="metric-card">'
+        f"<span>{html_text(label)}</span>"
+        f"<strong>{html_count(value)}</strong>"
+        f"<small>{html_text(detail)}</small>"
+        "</section>"
+    )
+
+
+def html_table(headers: list[str], rows: list[list[Any]], empty_text: str) -> str:
+    header_cells = "".join(f"<th>{html_text(header)}</th>" for header in headers)
+    if rows:
+        body_rows = []
+        for row in rows:
+            body_rows.append("<tr>" + "".join(f"<td>{html_count(cell)}</td>" for cell in row) + "</tr>")
+        body = "".join(body_rows)
+    else:
+        body = f'<tr><td colspan="{len(headers)}" class="empty">{html_text(empty_text)}</td></tr>'
+    return f"<table><thead><tr>{header_cells}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def html_definition_list(items: list[tuple[str, Any]]) -> str:
+    if not items:
+        return '<p class="empty">none</p>'
+    rows = []
+    for label, value in items:
+        rows.append(f"<div><dt>{html_text(label)}</dt><dd>{html_count(value)}</dd></div>")
+    return "<dl>" + "".join(rows) + "</dl>"
+
+
+def counter_items(values: dict[str, Any]) -> list[tuple[str, Any]]:
+    return [(key, value) for key, value in values.items() if value]
+
+
+def nested_counter_items(values: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
+    items: list[tuple[str, Any]] = []
+    for group, counters in values.items():
+        formatted = format_counter_map(counters)
+        if formatted:
+            items.append((group, formatted))
+    return items
+
+
+def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: str | None = None) -> str:
+    generated = generated_at or utc_now_iso()
+    runs = report["runs"]
+    reviews = report["reviews"]
+    validation = report["validation"]
+    gates = report["gates"]
+    tokens = report["tokens"]
+    filters = report["filters"]
+    warning_count = int(report.get("warning_count", 0) or 0)
+    warning_html = ""
+    if warning_count:
+        warning_html = (
+            '<section class="warning">'
+            f"<strong>Warnings</strong>"
+            f"<span>skipped {warning_count} malformed historical lines</span>"
+            "</section>"
+        )
+
+    filter_text = " ".join(
+        f"{name}={value}"
+        for name, value in {
+            "client": client,
+            "repo": filters.get("repo"),
+            "current_repo": filters.get("current_repo"),
+            "skill": filters.get("skill") or "all",
+            "since": filters.get("since") or "beginning",
+            "until": filters.get("until") or "now",
+        }.items()
+        if value is not None
+    )
+    run_rows = [
+        [
+            group["skill"],
+            group["status"],
+            group["run_count"],
+            format_duration(group["average_duration_seconds"]),
+            group["last_timestamp"],
+        ]
+        for group in runs["groups"]
+    ]
+    validation_rows = [
+        [
+            kind,
+            summary["attempt_count"],
+            summary["failure_count"],
+            summary["retry_count"],
+            summary["final_pass_count"],
+            summary["final_fail_count"],
+        ]
+        for kind, summary in validation["command_kinds"].items()
+    ]
+    token_items = [
+        (
+            source_quality,
+            f"rows={summary['row_count']} sessions={summary['session_count']} total_tokens="
+            + ("n/a" if source_quality == "unavailable" else str(summary["totals"]["total_tokens"])),
+        )
+        for source_quality, summary in (
+            ("exact", tokens["exact"]),
+            ("estimated", tokens["estimated"]),
+            ("unavailable", tokens["unavailable"]),
+        )
+    ]
+
+    return "\n".join(
+        [
+            "<!doctype html>",
+            '<html lang="en">',
+            "<head>",
+            '<meta charset="utf-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            "<title>Dreamers Stats</title>",
+            "<style>",
+            ":root{color-scheme:light;--ink:#17211b;--muted:#5d6b62;--line:#d8e0da;--paper:#f8faf7;--panel:#ffffff;--accent:#0f6f5f;--warn:#9a5b00}",
+            "body{margin:0;background:linear-gradient(180deg,#eef5ef,#f8faf7 34%);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,sans-serif}",
+            "main{max-width:1120px;margin:0 auto;padding:32px 20px 48px}",
+            "header{margin-bottom:24px}h1{font-size:34px;line-height:1.1;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}",
+            ".filters,.generated,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}",
+            ".metric-card,section.panel,.warning{border:1px solid var(--line);background:var(--panel);border-radius:8px;box-shadow:0 1px 1px rgba(23,33,27,.04)}",
+            ".metric-card{padding:14px}.metric-card span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase}.metric-card strong{display:block;font-size:26px;margin:4px 0}",
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.panel{padding:18px;margin:16px 0;overflow:auto}.warning{padding:12px 14px;color:var(--warn);margin:16px 0}",
+            "table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 6px;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase}",
+            "dl{display:grid;gap:8px;margin:0}dl div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:6px 0}dt{color:var(--muted)}dd{margin:0;text-align:right}.empty{color:var(--muted)}",
+            "</style>",
+            "</head>",
+            "<body>",
+            "<main>",
+            "<header>",
+            "<h1>Dreamers Stats</h1>",
+            f'<div class="filters">Filters: {html_text(filter_text)}</div>',
+            f'<div class="generated">Generated: {html_text(generated)}</div>',
+            "</header>",
+            warning_html,
+            '<section class="metrics">',
+            html_metric_card("Runs", runs["run_count"], "skill invocations"),
+            html_metric_card("Validation", validation["attempt_count"], "attempts"),
+            html_metric_card("Reviews", reviews["review_count"], f"{reviews['blocked_count']} blocked"),
+            html_metric_card("Gates", sum(gates["gate_type_counts"].values()), "decisions"),
+            html_metric_card("Tokens", tokens["exact"]["totals"]["total_tokens"], "exact total"),
+            "</section>",
+            '<section class="panel"><h2>Runs by skill</h2>',
+            html_table(
+                ["Skill", "Status", "Runs", "Avg duration", "Last seen"],
+                run_rows,
+                "no runs matched these filters",
+            ),
+            "</section>",
+            '<section class="panel"><h2>Validation</h2>',
+            html_table(
+                ["Kind", "Attempts", "Failures", "Retries", "Final passes", "Final failures"],
+                validation_rows,
+                "no validation attempts matched these filters",
+            ),
+            "</section>",
+            '<section class="grid">',
+            '<section class="panel"><h2>Reviews</h2>',
+            html_definition_list(
+                [
+                    ("initial reviews", reviews["initial_review_count"]),
+                    ("rereviews", reviews["rereview_count"]),
+                    ("open questions", reviews["open_question_count"]),
+                    ("findings", format_counter_map(reviews["findings_by_severity"]) or "none"),
+                    ("artifact mismatches", reviews["artifact_summary"]["mismatch_count"]),
+                ]
+            ),
+            "</section>",
+            '<section class="panel"><h2>Gates</h2>',
+            html_definition_list(counter_items(gates["gate_type_counts"]) + nested_counter_items(gates["decision_counts"])),
+            "</section>",
+            '<section class="panel"><h2>Tokens</h2>',
+            html_definition_list(token_items),
+            "</section>",
+            "</section>",
+            "</main>",
+            "</body>",
+            "</html>",
+            "",
+        ]
+    )
+
+
 def format_filter_header(filters: dict[str, Any]) -> str:
     parts = [f"repo={filters['repo']}"]
+    if filters.get("current_repo"):
+        parts.append(f"current_repo={filters['current_repo']}")
     if filters.get("skill"):
         parts.append(f"skill={filters['skill']}")
     if filters.get("since"):
@@ -2002,6 +2201,25 @@ def run_report_command(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
     if args.json:
         return report, json.dumps(report, sort_keys=True)
     return report, REPORT_FORMATTERS[args.command](report)
+
+
+def build_dashboard_output(args: argparse.Namespace) -> str:
+    context = resolve_args_context(args)
+    report = run_report(
+        "summarize",
+        client=context.client,
+        home=context.home,
+        repo=args.repo,
+        skill=args.skill,
+        since=args.since,
+        until=args.until,
+        cwd=Path.cwd(),
+    )
+    return render_dashboard_html(
+        report,
+        client=context.client,
+        generated_at=getattr(args, "generated_at", None),
+    )
 
 
 def load_event(args: argparse.Namespace, stdin: TextIO) -> dict[str, Any]:
@@ -2087,16 +2305,25 @@ def build_parser() -> argparse.ArgumentParser:
         report_parser = subcommands.add_parser(name)
         add_report_arguments(report_parser)
 
+    dashboard_parser = subcommands.add_parser("dashboard")
+    add_report_filter_arguments(dashboard_parser)
+    dashboard_parser.add_argument("--output")
+    dashboard_parser.add_argument("--generated-at", help=argparse.SUPPRESS)
+
     return parser
 
 
 def add_report_arguments(parser: argparse.ArgumentParser) -> None:
+    add_report_filter_arguments(parser)
+    parser.add_argument("--json", action="store_true")
+
+
+def add_report_filter_arguments(parser: argparse.ArgumentParser) -> None:
     add_client_options(parser)
     parser.add_argument("--repo", choices=("current", "all"), default="current")
     parser.add_argument("--skill")
     parser.add_argument("--since")
     parser.add_argument("--until")
-    parser.add_argument("--json", action="store_true")
 
 
 def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
@@ -2185,6 +2412,27 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
             print("read_failed", file=sys.stderr)
             return 1
         print(output)
+        return 0
+
+    if args.command == "dashboard":
+        try:
+            output = build_dashboard_output(args)
+        except StatsValidationError as exc:
+            print(exc.category, file=sys.stderr)
+            return 2
+        except OSError:
+            print("read_failed", file=sys.stderr)
+            return 1
+        if args.output:
+            try:
+                output_path = Path(args.output).expanduser()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(output, encoding="utf-8")
+            except OSError:
+                print("write_failed", file=sys.stderr)
+                return 1
+        else:
+            sys.stdout.write(output)
         return 0
 
     parser.error("unknown command")

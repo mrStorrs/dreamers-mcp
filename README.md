@@ -83,9 +83,12 @@ python3 -m unittest discover -s tests
 ```bash
 python3 -m dreamers_stats doctor --client copilot --home /tmp/copilot-home --json
 python3 -m dreamers_stats summarize --client codex --home /tmp/codex-home --json
+python3 -m dreamers_stats dashboard --client codex --home /tmp/codex-home --repo all --output /tmp/dreamers-stats.html
 python3 -m dreamers_stats hook --client copilot --home /tmp/copilot-home --event-name sessionStart < payload.json
 python3 -m dreamers_stats hook --client codex --home /tmp/codex-home --event-name UserPromptSubmit < payload.json
 ```
+
+The `dashboard` command renders a standalone HTML file from the existing bounded reports. Omit `--output` to print the HTML document to stdout. Use `--repo all` for a first smoke test, or run `--repo current` from the repository whose stats you want to inspect.
 
 Compatibility aliases remain available for current Copilot callers:
 

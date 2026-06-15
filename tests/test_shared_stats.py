@@ -630,6 +630,165 @@ class SharedStatsTests(unittest.TestCase):
                 self.assertEqual("", stderr)
                 assertion(json.loads(stdout))
 
+    def test_dashboard_command_writes_standalone_html_file(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_dashboard_start",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_01",
+                skill="dreamers-full",
+                metrics={"mode": "plan-path", "plan_count": 1},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_done",
+                timestamp="2026-06-13T10:02:00Z",
+                run_id="run_dashboard_01",
+                skill="dreamers-full",
+                metrics={"final_status": "completed", "plan_count": 1},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        output_path = Path(self.tmp.name) / "dreamers-stats.html"
+
+        code, stdout, stderr = self.invoke(
+            [
+                "dashboard",
+                "--client",
+                "codex",
+                "--home",
+                str(self.codex_home),
+                "--repo",
+                "current",
+                "--generated-at",
+                "2026-06-15T00:00:00Z",
+                "--output",
+                str(output_path),
+            ],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        self.assertGreater(output_path.stat().st_size, 1000)
+        html_text = output_path.read_text(encoding="utf-8")
+        self.assertIn("<!doctype html>", html_text)
+        self.assertIn("Dreamers Stats", html_text)
+        self.assertIn(f"current_repo={self.fixture_repo}", html_text)
+        self.assertIn("Runs by skill", html_text)
+        self.assertIn("Reviews", html_text)
+        self.assertIn("Validation", html_text)
+        self.assertIn("Gates", html_text)
+        self.assertIn("Tokens", html_text)
+        self.assertIn("dreamers-full", html_text)
+
+        code, stdout, stderr = self.invoke(
+            [
+                "dashboard",
+                "--client",
+                "codex",
+                "--home",
+                str(self.codex_home),
+                "--repo",
+                "current",
+                "--generated-at",
+                "2026-06-15T00:00:00Z",
+            ],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertEqual(html_text, stdout)
+
+    def test_dashboard_command_writes_html_to_stdout_without_output_path(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_stdout",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_stdout",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            )
+        )
+
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn("<!doctype html>", stdout)
+        self.assertIn("dreamers-lite", stdout)
+
+    def test_dashboard_empty_state_names_active_filter(self):
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn(f"current_repo={self.fixture_repo}", stdout)
+        self.assertIn("no runs matched these filters", stdout)
+        self.assertIn("no validation attempts matched these filters", stdout)
+
+    def test_dashboard_renderer_escapes_report_values(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_escape",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_escape",
+                skill="dreamers-<script>&",
+                metrics={"final_status": "completed"},
+            )
+        )
+        report = runtime.run_report(
+            "summarize",
+            client="copilot",
+            home=self.copilot_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        html_text = runtime.render_dashboard_html(report, client="copilot", generated_at="2026-06-15T00:00:00Z")
+
+        self.assertNotIn("dreamers-<script>&", html_text)
+        self.assertIn("dreamers-&lt;script&gt;&amp;", html_text)
+
+    def test_dashboard_includes_malformed_line_warning(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_warning",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_warning",
+                skill="dreamers-full",
+                metrics={"final_status": "completed"},
+            )
+        )
+        self.write_fixture_lines(['{"not":"valid"', '{"event_id":"missing_fields"}'])
+
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn("Warnings", stdout)
+        self.assertIn("skipped 2 malformed historical lines", stdout)
+
     def test_runs_report_preserves_real_run_identity_and_final_status(self):
         self.record_fixture_event(
             self.fixture_event(
