@@ -1083,6 +1083,146 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual("", stderr)
         self.assertEqual(html_text, stdout)
 
+    def test_dashboard_formats_values_timestamps_and_status_badges(self):
+        events = [
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_dashboard_completed_start",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_completed",
+                skill="dreamers-full",
+                metrics={"mode": "plan-path"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_completed_done",
+                timestamp="2026-06-13T10:02:00Z",
+                run_id="run_dashboard_completed",
+                skill="dreamers-full",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_dashboard_halted_start",
+                timestamp="2026-06-13T10:03:00Z",
+                run_id="run_dashboard_halted",
+                skill="dreamers-update",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_halted",
+                event_id="evt_dashboard_halted",
+                timestamp="2026-06-13T10:05:00Z",
+                run_id="run_dashboard_halted",
+                skill="dreamers-update",
+                metrics={"halt_reason_category": "user_halt"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_dashboard_progress",
+                timestamp="2026-06-13T10:06:00Z",
+                run_id="run_dashboard_progress",
+                skill="dreamers-note",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_dashboard_large_tokens",
+                timestamp="2026-06-13T10:20:00Z",
+                run_id="run_dashboard_completed",
+                session_id="sess_dashboard_tokens",
+                skill="dreamers-full",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "session",
+                    "input_tokens": 1000000,
+                    "output_tokens": 234567,
+                    "total_tokens": 1234567,
+                    "cache_read_tokens": 12000,
+                    "cache_write_tokens": 3000,
+                    "ai_credits": 12.5,
+                },
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event)
+        report = runtime.run_report(
+            "summarize",
+            client="copilot",
+            home=self.copilot_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        html_text = runtime.render_dashboard_html(report, client="copilot", generated_at="2026-06-15T07:05:37Z")
+
+        self.assertIn("Generated: Jun 15, 2026 07:05 UTC", html_text)
+        self.assertIn("Data range: Jun 13, 2026 10:00 UTC to Jun 13, 2026 10:20 UTC", html_text)
+        self.assertIn("<strong>1,234,567</strong>", html_text)
+        self.assertIn('<span class="status-badge status-completed">completed</span>', html_text)
+        self.assertIn('<span class="status-badge status-halted">halted</span>', html_text)
+        self.assertIn('<span class="status-badge status-in-progress">in_progress</span>', html_text)
+
+    def test_dashboard_cli_uses_structured_gate_and_token_tables(self):
+        events = [
+            self.fixture_event(
+                "gate_decided",
+                event_id="evt_dashboard_gate_plan",
+                timestamp="2026-06-13T09:00:00Z",
+                run_id="run_dashboard_gate",
+                skill="dreamers-full",
+                metrics={"gate_type": "plan-approval", "decision": "approved"},
+            ),
+            self.fixture_event(
+                "gate_decided",
+                event_id="evt_dashboard_gate_push",
+                timestamp="2026-06-13T09:05:00Z",
+                run_id="run_dashboard_gate",
+                skill="dreamers-full",
+                metrics={"gate_type": "push-decision", "decision": "approved"},
+            ),
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_dashboard_cli_tokens",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_tokens",
+                session_id="sess_dashboard_cli_tokens",
+                skill="dreamers-full",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "session",
+                    "input_tokens": 1000000,
+                    "output_tokens": 2000,
+                    "total_tokens": 1002000,
+                    "cache_read_tokens": 3000,
+                    "cache_write_tokens": 4000,
+                    "ai_credits": 2.0,
+                },
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event)
+
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn("<th scope=\"col\">Gate</th>", stdout)
+        self.assertIn("<th scope=\"col\">Decisions</th>", stdout)
+        self.assertIn("<td>plan-approval</td><td>1</td><td>approved=1</td>", stdout)
+        self.assertIn("<td>push-decision</td><td>1</td><td>approved=1</td>", stdout)
+        self.assertIn("<th scope=\"col\">Quality</th>", stdout)
+        self.assertIn("<td>exact</td><td>1</td><td>1</td><td>1,000,000</td>", stdout)
+        self.assertNotIn("<dt>plan-approval</dt>", stdout)
+        self.assertNotIn("rows=1 sessions=1 total_tokens=1002000", stdout)
+
     def test_dashboard_command_writes_html_to_stdout_without_output_path(self):
         self.record_fixture_event(
             self.fixture_event(
@@ -1138,7 +1278,8 @@ class SharedStatsTests(unittest.TestCase):
 
         html_text = runtime.render_dashboard_html(report, client="copilot", generated_at="2026-06-15T00:00:00Z")
 
-        self.assertIn("<span>Tokens</span><strong>n/a</strong><small>unavailable</small>", html_text)
+        self.assertIn("<span>Tokens</span><strong>n/a</strong><small>unavailable totals</small>", html_text)
+        self.assertIn("<td>unavailable</td><td>1</td><td>1</td><td>n/a</td>", html_text)
         self.assertNotIn("<span>Tokens</span><strong>0</strong><small>exact total</small>", html_text)
 
     def test_dashboard_renderer_escapes_report_values(self):
@@ -1187,6 +1328,7 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual("", stderr)
         self.assertIn("Warnings", stdout)
         self.assertIn("skipped 2 malformed historical lines", stdout)
+        self.assertIn(".warning{display:flex", stdout)
 
     def test_runs_report_preserves_real_run_identity_and_final_status(self):
         self.record_fixture_event(
