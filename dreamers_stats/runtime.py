@@ -2356,10 +2356,86 @@ def html_text(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+class HtmlFragment(str):
+    pass
+
+
+def html_fragment(value: str) -> HtmlFragment:
+    return HtmlFragment(value)
+
+
+def format_dashboard_number(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        formatted = f"{value:,.2f}"
+        return formatted.rstrip("0").rstrip(".")
+    return str(value)
+
+
 def html_count(value: Any) -> str:
     if value is None:
         return "n/a"
-    return html_text(value)
+    return html_text(format_dashboard_number(value))
+
+
+def html_cell(value: Any) -> str:
+    if isinstance(value, HtmlFragment):
+        return str(value)
+    return html_count(value)
+
+
+def format_dashboard_timestamp(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        parsed = parse_iso_timestamp(str(value)).astimezone(UTC)
+    except StatsValidationError:
+        return str(value)
+    return f"{parsed.strftime('%b')} {parsed.day}, {parsed.year} {parsed:%H:%M} UTC"
+
+
+def dashboard_range_text(report: dict[str, Any]) -> str:
+    timestamps: list[datetime] = []
+    for section_name in ("runs", "reviews", "validation", "gates", "tokens"):
+        section = report.get(section_name, {})
+        date_range = section.get("range", {}) if isinstance(section, dict) else {}
+        for key in ("first_timestamp", "last_timestamp"):
+            timestamp = date_range.get(key)
+            if timestamp is None:
+                continue
+            try:
+                timestamps.append(parse_iso_timestamp(str(timestamp)).astimezone(UTC))
+            except StatsValidationError:
+                continue
+    if not timestamps:
+        return "no matching events"
+    first = min(timestamps)
+    last = max(timestamps)
+    first_text = format_dashboard_timestamp(datetime_to_iso(first))
+    last_text = format_dashboard_timestamp(datetime_to_iso(last))
+    if first == last:
+        return first_text
+    return f"{first_text} to {last_text}"
+
+
+def html_status_badge(status: Any) -> HtmlFragment:
+    status_text = str(status)
+    status_slug = re.sub(r"[^a-z0-9]+", "-", status_text.lower()).strip("-") or "unknown"
+    return html_fragment(
+        f'<span class="status-badge status-{html_text(status_slug)}">{html_text(status_text)}</span>'
+    )
+
+
+def format_dashboard_counter_map(values: dict[str, Any]) -> str:
+    items = [
+        f"{key}={format_dashboard_number(value)}"
+        for key, value in values.items()
+        if value
+    ]
+    return ", ".join(items)
 
 
 def html_metric_card(label: str, value: Any, detail: str) -> str:
@@ -2373,11 +2449,11 @@ def html_metric_card(label: str, value: Any, detail: str) -> str:
 
 
 def html_table(headers: list[str], rows: list[list[Any]], empty_text: str) -> str:
-    header_cells = "".join(f"<th>{html_text(header)}</th>" for header in headers)
+    header_cells = "".join(f'<th scope="col">{html_text(header)}</th>' for header in headers)
     if rows:
         body_rows = []
         for row in rows:
-            body_rows.append("<tr>" + "".join(f"<td>{html_count(cell)}</td>" for cell in row) + "</tr>")
+            body_rows.append("<tr>" + "".join(f"<td>{html_cell(cell)}</td>" for cell in row) + "</tr>")
         body = "".join(body_rows)
     else:
         body = f'<tr><td colspan="{len(headers)}" class="empty">{html_text(empty_text)}</td></tr>'
@@ -2412,7 +2488,7 @@ def dashboard_token_metric(tokens: dict[str, Any]) -> tuple[Any, str]:
     if tokens["estimated"]["row_count"]:
         return tokens["estimated"]["totals"]["total_tokens"], "estimated total"
     if tokens["unavailable"]["row_count"]:
-        return "n/a", "unavailable"
+        return "n/a", "unavailable totals"
     return 0, "exact total"
 
 
@@ -2449,10 +2525,10 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
     run_rows = [
         [
             group["skill"],
-            group["status"],
+            html_status_badge(group["status"]),
             group["run_count"],
             format_duration(group["average_duration_seconds"]),
-            group["last_timestamp"],
+            format_dashboard_timestamp(group["last_timestamp"]),
         ]
         for group in runs["groups"]
     ]
@@ -2467,12 +2543,25 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
         ]
         for kind, summary in validation["command_kinds"].items()
     ]
-    token_items = [
-        (
+    gate_rows = [
+        [
+            gate_type,
+            total,
+            format_dashboard_counter_map(gates["decision_counts"].get(gate_type, {})) or "none",
+        ]
+        for gate_type, total in gates["gate_type_counts"].items()
+    ]
+    token_rows = [
+        [
             source_quality,
-            f"rows={summary['row_count']} sessions={summary['session_count']} total_tokens="
-            + ("n/a" if source_quality == "unavailable" else str(summary["totals"]["total_tokens"])),
-        )
+            summary["row_count"],
+            summary["session_count"],
+            summary["totals"]["input_tokens"],
+            summary["totals"]["output_tokens"],
+            summary["totals"]["cache_read_tokens"],
+            summary["totals"]["cache_write_tokens"],
+            summary["totals"]["total_tokens"],
+        ]
         for source_quality, summary in (
             ("exact", tokens["exact"]),
             ("estimated", tokens["estimated"]),
@@ -2480,6 +2569,8 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
         )
     ]
     token_metric_value, token_metric_detail = dashboard_token_metric(tokens)
+    validation_failures = sum(summary["failure_count"] for summary in validation["command_kinds"].values())
+    validation_final_failures = sum(summary["final_fail_count"] for summary in validation["command_kinds"].values())
 
     return "\n".join(
         [
@@ -2490,15 +2581,16 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             '<meta name="viewport" content="width=device-width, initial-scale=1">',
             "<title>Dreamers Stats</title>",
             "<style>",
-            ":root{color-scheme:light;--ink:#17211b;--muted:#5d6b62;--line:#d8e0da;--paper:#f8faf7;--panel:#ffffff;--accent:#0f6f5f;--warn:#9a5b00}",
+            ":root{color-scheme:light;--ink:#17211b;--muted:#5d6b62;--line:#d8e0da;--paper:#f8faf7;--panel:#ffffff;--accent:#0f6f5f;--warn:#9a5b00;--ok:#176d3b;--hold:#a24b1d;--active:#1f5f99}",
             "body{margin:0;background:linear-gradient(180deg,#eef5ef,#f8faf7 34%);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,sans-serif}",
             "main{max-width:1120px;margin:0 auto;padding:32px 20px 48px}",
             "header{margin-bottom:24px}h1{font-size:34px;line-height:1.1;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}",
-            ".filters,.generated,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}",
+            ".filters,.generated,.range,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}",
             ".metric-card,section.panel,.warning{border:1px solid var(--line);background:var(--panel);border-radius:8px;box-shadow:0 1px 1px rgba(23,33,27,.04)}",
             ".metric-card{padding:14px}.metric-card span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase}.metric-card strong{display:block;font-size:26px;margin:4px 0}",
-            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.panel{padding:18px;margin:16px 0;overflow:auto}.warning{padding:12px 14px;color:var(--warn);margin:16px 0}",
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.panel{padding:18px;margin:16px 0;overflow:auto}.warning{display:flex;gap:8px;padding:12px 14px;color:var(--warn);margin:16px 0}",
             "table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 6px;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase}",
+            ".status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:#eef3f0;color:var(--muted)}.status-completed{background:#e6f4eb;color:var(--ok)}.status-in-progress{background:#e8f1fb;color:var(--active)}.status-halted{background:#fff0e6;color:var(--hold)}",
             "dl{display:grid;gap:8px;margin:0}dl div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:6px 0}dt{color:var(--muted)}dd{margin:0;text-align:right}.empty{color:var(--muted)}",
             "</style>",
             "</head>",
@@ -2507,14 +2599,15 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             "<header>",
             "<h1>Dreamers Stats</h1>",
             f'<div class="filters">Filters: {html_text(filter_text)}</div>',
-            f'<div class="generated">Generated: {html_text(generated)}</div>',
+            f'<div class="generated">Generated: {html_text(format_dashboard_timestamp(generated))}</div>',
+            f'<div class="range">Data range: {html_text(dashboard_range_text(report))}</div>',
             "</header>",
             warning_html,
             '<section class="metrics">',
             html_metric_card("Runs", runs["run_count"], "skill invocations"),
-            html_metric_card("Validation", validation["attempt_count"], "attempts"),
-            html_metric_card("Reviews", reviews["review_count"], f"{reviews['blocked_count']} blocked"),
-            html_metric_card("Gates", sum(gates["gate_type_counts"].values()), "decisions"),
+            html_metric_card("Validation", validation["attempt_count"], f"{validation_failures} failed, {validation_final_failures} final failures"),
+            html_metric_card("Reviews", reviews["review_count"], f"{reviews['blocked_count']} blocked, {reviews['open_question_count']} open questions"),
+            html_metric_card("Gates", sum(gates["gate_type_counts"].values()), f"{len(gates['gate_type_counts'])} gate types"),
             html_metric_card("Tokens", token_metric_value, token_metric_detail),
             "</section>",
             '<section class="panel"><h2>Runs by skill</h2>',
@@ -2544,10 +2637,18 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             ),
             "</section>",
             '<section class="panel"><h2>Gates</h2>',
-            html_definition_list(counter_items(gates["gate_type_counts"]) + nested_counter_items(gates["decision_counts"])),
+            html_table(
+                ["Gate", "Total", "Decisions"],
+                gate_rows,
+                "no gate decisions matched these filters",
+            ),
             "</section>",
             '<section class="panel"><h2>Tokens</h2>',
-            html_definition_list(token_items),
+            html_table(
+                ["Quality", "Rows", "Sessions", "Input", "Output", "Cache read", "Cache write", "Total"],
+                token_rows,
+                "no token usage matched these filters",
+            ),
             "</section>",
             "</section>",
             "</main>",
