@@ -55,7 +55,7 @@ Options:
 - `--dreamers-mcp-path /path/to/dreamers-mcp` or `-DreamersMcpPath "D:\projects\dreamers-mcp"` to copy the runtime from another local checkout
 - `--force` or `-Force` to overwrite existing bundle-managed files
 
-The installer copies the shared runtime into `dreamers/runtime/dreamers_stats/`, installs the Codex compatibility shim and MCP server launcher into `dreamers/scripts/`, merges managed Dreamers hook handlers into `hooks.json`, and appends a managed Dreamers MCP block to `config.toml`. If an existing `hooks.json` or `config.toml` is not safe to merge automatically, the installer leaves that file unchanged and prints exact manual registration snippets.
+The installer copies the shared runtime into `dreamers/runtime/dreamers_stats/`, installs the Codex compatibility shim and MCP server launcher into `dreamers/scripts/`, installs a Dreamers stats ref into `dreamers/refs/`, merges managed Dreamers hook handlers into `hooks.json`, appends a managed Dreamers MCP block to `config.toml`, and prepends a managed Dreamers stats block to `AGENTS.md`. That global `AGENTS.md` block only activates when Codex is running a `dreamers-*` skill, and it points at the separate `dreamers/refs/dreamers-mcp-stats.md` ref so Dreamers bookends stay owned by `dreamers-mcp` instead of `dreamers-codex`. If an existing `hooks.json`, `config.toml`, or `AGENTS.md` is not safe to merge automatically, the installer leaves that file unchanged and prints exact manual registration snippets.
 
 Remove the optional bundle without touching historical stats data:
 

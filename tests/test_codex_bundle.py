@@ -3,6 +3,7 @@ import os
 import shutil
 
 from tests.bundle_test_support import (
+    CODEX_AGENTS_CONFIG_RELATIVE,
     CODEX_BASH_INSTALLER_PATH,
     CODEX_BASH_REMOVER_PATH,
     CODEX_BASH_WRAPPER_RELATIVE,
@@ -14,6 +15,7 @@ from tests.bundle_test_support import (
     CODEX_POWERSHELL_REMOVER_PATH,
     CODEX_POWERSHELL_WRAPPER_RELATIVE,
     CODEX_SHIM_RELATIVE,
+    CODEX_STATS_REF_RELATIVE,
     INSTALLED_RUNTIME_PACKAGE_RELATIVE,
     BundleTestCase,
     REPO_ROOT,
@@ -26,6 +28,9 @@ class CodexBundleTests(BundleTestCase):
         historic_events.parent.mkdir(parents=True, exist_ok=True)
         historic_events.write_text('{"event_id":"historic"}\n', encoding="utf-8")
         self.codex_home.mkdir(parents=True, exist_ok=True)
+        agents_path = self.codex_home / CODEX_AGENTS_CONFIG_RELATIVE
+        original_agents = "# Personal Instructions\n\nKeep this line.\n"
+        agents_path.write_text(original_agents, encoding="utf-8")
 
         hooks_config = self.codex_home / CODEX_HOOKS_CONFIG_RELATIVE
         hooks_config.write_text(
@@ -66,6 +71,7 @@ class CodexBundleTests(BundleTestCase):
         self.assertTrue((self.codex_home / CODEX_MCP_SERVER_SHIM_RELATIVE).exists())
         self.assertTrue((self.codex_home / INSTALLED_RUNTIME_PACKAGE_RELATIVE / "runtime.py").exists())
         self.assertTrue((self.codex_home / CODEX_INSTALL_STATE_RELATIVE).exists())
+        self.assertTrue((self.codex_home / CODEX_STATS_REF_RELATIVE).exists())
         self.assertEqual('{"event_id":"historic"}\n', historic_events.read_text(encoding="utf-8"))
 
         hooks_payload = json.loads(hooks_config.read_text(encoding="utf-8"))
@@ -80,6 +86,20 @@ class CodexBundleTests(BundleTestCase):
         config_text = config_toml.read_text(encoding="utf-8")
         self.assertIn('[mcp_servers.keep]', config_text)
         self.assertIn('[mcp_servers.dreamers_stats]', config_text)
+        agents_text = agents_path.read_text(encoding="utf-8")
+        self.assertIn("Keep this line.", agents_text)
+        self.assertIn("BEGIN DREAMERS MCP CODEX STATS", agents_text)
+        self.assertIn("dreamers-mcp-stats.md", agents_text)
+        self.assertIn("starts with `dreamers-`", agents_text)
+        ref_text = (self.codex_home / CODEX_STATS_REF_RELATIVE).read_text(encoding="utf-8")
+        self.assertIn("<dreamers-mcp-skill-bookends>", ref_text)
+        self.assertIn("skill_started", ref_text)
+        self.assertIn("validation_attempt", ref_text)
+        self.assertIn("gate_decided", ref_text)
+        self.assertIn("skill_completed", ref_text)
+        self.assertIn("skill_halted", ref_text)
+        self.assertIn("approved_start_implementation", ref_text)
+        self.assertIn("py -3", ref_text)
 
         removed = self.run_shell_script(
             CODEX_BASH_REMOVER_PATH,
@@ -94,6 +114,7 @@ class CodexBundleTests(BundleTestCase):
         self.assertFalse((self.codex_home / CODEX_MCP_SERVER_SHIM_RELATIVE).exists())
         self.assertFalse((self.codex_home / INSTALLED_RUNTIME_PACKAGE_RELATIVE).exists())
         self.assertFalse((self.codex_home / CODEX_INSTALL_STATE_RELATIVE).exists())
+        self.assertFalse((self.codex_home / CODEX_STATS_REF_RELATIVE).exists())
         self.assertEqual('{"event_id":"historic"}\n', historic_events.read_text(encoding="utf-8"))
 
         hooks_after = json.loads(hooks_config.read_text(encoding="utf-8"))
@@ -103,6 +124,7 @@ class CodexBundleTests(BundleTestCase):
         config_after = config_toml.read_text(encoding="utf-8")
         self.assertIn('[mcp_servers.keep]', config_after)
         self.assertNotIn('[mcp_servers.dreamers_stats]', config_after)
+        self.assertEqual(original_agents, agents_path.read_text(encoding="utf-8"))
 
     def test_bash_install_leaves_unsafe_config_unchanged_and_prints_manual_steps(self):
         self.codex_home.mkdir(parents=True, exist_ok=True)
@@ -132,6 +154,31 @@ class CodexBundleTests(BundleTestCase):
         self.assertIn("Manual hook registration", combined_output)
         self.assertIn("Manual MCP registration", combined_output)
         self.assertTrue((self.codex_home / CODEX_BASH_WRAPPER_RELATIVE).exists())
+
+    def test_remove_preserves_user_modified_stats_ref(self):
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        installed = self.run_shell_script(
+            CODEX_BASH_INSTALLER_PATH,
+            "--codex-home",
+            str(self.codex_home),
+            "--dreamers-mcp-path",
+            str(REPO_ROOT),
+        )
+        self.assertEqual(0, installed.returncode, installed.stderr)
+
+        stats_ref = self.codex_home / CODEX_STATS_REF_RELATIVE
+        stats_ref.write_text("# user-modified\n", encoding="utf-8")
+
+        removed = self.run_shell_script(
+            CODEX_BASH_REMOVER_PATH,
+            "--codex-home",
+            str(self.codex_home),
+        )
+
+        self.assertEqual(0, removed.returncode, removed.stderr)
+        self.assertTrue(stats_ref.exists())
+        self.assertEqual("# user-modified\n", stats_ref.read_text(encoding="utf-8"))
+        self.assertFalse((self.codex_home / CODEX_AGENTS_CONFIG_RELATIVE).exists())
 
     def test_installed_wrapper_records_safe_codex_events_and_mcp_server_reports_unavailable_tokens(self):
         self.codex_home.mkdir(parents=True, exist_ok=True)
@@ -250,6 +297,7 @@ class CodexBundleTests(BundleTestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertFalse((self.codex_home / CODEX_HOOKS_CONFIG_RELATIVE).exists())
         self.assertFalse((self.codex_home / CODEX_MCP_CONFIG_RELATIVE).exists())
+        self.assertFalse((self.codex_home / CODEX_AGENTS_CONFIG_RELATIVE).exists())
         self.assertIn("required bundle assets were not installed cleanly", completed.stdout)
 
     def test_powershell_install_and_remove_preserve_history_and_user_config(self):

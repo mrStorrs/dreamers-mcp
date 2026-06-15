@@ -31,8 +31,10 @@ CODEX_POWERSHELL_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hoo
 CODEX_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_stats.py"
 CODEX_MCP_SERVER_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_mcp_server.py"
 CODEX_INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "codex-bundle.json"
+CODEX_AGENTS_CONFIG_RELATIVE = Path("AGENTS.md")
 CODEX_HOOKS_CONFIG_RELATIVE = Path("hooks.json")
 CODEX_MCP_CONFIG_RELATIVE = Path("config.toml")
+CODEX_STATS_REF_RELATIVE = Path("dreamers") / "refs" / "dreamers-mcp-stats.md"
 
 
 def valid_event(**overrides):

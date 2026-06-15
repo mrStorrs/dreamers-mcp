@@ -22,11 +22,17 @@ HOOK_EVENTS = (
 INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "codex-bundle.json"
 RUNTIME_TARGET_RELATIVE = Path("dreamers") / "runtime" / "dreamers_stats"
 SCRIPTS_TARGET_RELATIVE = Path("dreamers") / "scripts"
+REFS_TARGET_RELATIVE = Path("dreamers") / "refs"
+AGENTS_CONFIG_RELATIVE = Path("AGENTS.md")
 HOOKS_CONFIG_RELATIVE = Path("hooks.json")
 MCP_CONFIG_RELATIVE = Path("config.toml")
 MANAGED_BLOCK_BEGIN = "# BEGIN DREAMERS MCP CODEX BUNDLE"
 MANAGED_BLOCK_END = "# END DREAMERS MCP CODEX BUNDLE"
+AGENTS_BLOCK_BEGIN = "<!-- BEGIN DREAMERS MCP CODEX STATS -->"
+AGENTS_BLOCK_END = "<!-- END DREAMERS MCP CODEX STATS -->"
 MANAGED_SERVER_ID = "dreamers_stats"
+STATS_REF_NAME = "dreamers-mcp-stats.md"
+STATS_REF_TAG = "dreamers-mcp-skill-bookends"
 REQUIRED_MANAGED_BUNDLE_KEYS = {
     (RUNTIME_TARGET_RELATIVE / name).as_posix()
     for name in RUNTIME_FILES
@@ -35,6 +41,7 @@ REQUIRED_MANAGED_BUNDLE_KEYS.update(
     (SCRIPTS_TARGET_RELATIVE / name).as_posix()
     for name in ("dreamers_hook.ps1", "dreamers_hook.sh", "dreamers_mcp_server.py", "dreamers_stats.py")
 )
+REQUIRED_MANAGED_BUNDLE_KEYS.add((REFS_TARGET_RELATIVE / STATS_REF_NAME).as_posix())
 
 
 @dataclass
@@ -42,6 +49,7 @@ class InstallResult:
     installed_count: int
     hook_configured: bool
     mcp_configured: bool
+    agents_configured: bool
     warnings: list[str]
     manual_steps: list[str]
 
@@ -79,7 +87,8 @@ def write_manifest(codex_home: Path, manifest: dict[str, object]) -> None:
 def resolve_checkout_root(candidate: str | Path | None, fallback_root: Path) -> Path:
     checkout_root = Path(candidate).expanduser() if candidate else fallback_root
     package_dir = checkout_root / "dreamers_stats"
-    bundle_dir = checkout_root / "bundles" / "codex" / "scripts"
+    scripts_dir = checkout_root / "bundles" / "codex" / "scripts"
+    refs_dir = checkout_root / "bundles" / "codex" / "refs"
     if not package_dir.is_dir():
         raise RuntimeError(
             f"Cannot find dreamers-mcp shared runtime at '{checkout_root}'. "
@@ -88,8 +97,14 @@ def resolve_checkout_root(candidate: str | Path | None, fallback_root: Path) -> 
     for name in RUNTIME_FILES:
         if not (package_dir / name).is_file():
             raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing dreamers_stats/{name}.")
-    if not bundle_dir.is_dir():
+    if not scripts_dir.is_dir():
         raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is missing bundles/codex/scripts.")
+    if not refs_dir.is_dir():
+        raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is missing bundles/codex/refs.")
+    if not (refs_dir / STATS_REF_NAME).is_file():
+        raise RuntimeError(
+            f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing bundles/codex/refs/{STATS_REF_NAME}."
+        )
     return checkout_root
 
 
@@ -102,12 +117,18 @@ def iter_runtime_sources(checkout_root: Path) -> list[tuple[Path, Path]]:
 
 
 def iter_bundle_sources(checkout_root: Path) -> list[tuple[Path, Path]]:
-    bundle_dir = checkout_root / "bundles" / "codex" / "scripts"
-    return [
-        (path, SCRIPTS_TARGET_RELATIVE / path.name)
-        for path in sorted(bundle_dir.iterdir())
-        if path.is_file()
-    ]
+    sources: list[tuple[Path, Path]] = []
+    bundle_directories = (
+        (checkout_root / "bundles" / "codex" / "scripts", SCRIPTS_TARGET_RELATIVE),
+        (checkout_root / "bundles" / "codex" / "refs", REFS_TARGET_RELATIVE),
+    )
+    for source_dir, target_root in bundle_directories:
+        sources.extend(
+            (path, target_root / path.name)
+            for path in sorted(source_dir.iterdir())
+            if path.is_file()
+        )
+    return sources
 
 
 def copy_bundle_files(
@@ -216,6 +237,26 @@ def manual_hook_instructions(codex_home: Path) -> str:
     return "Manual hook registration:\n" + json.dumps(payload, indent=2, sort_keys=True)
 
 
+def agents_ref_path(codex_home: Path) -> Path:
+    return codex_home / REFS_TARGET_RELATIVE / STATS_REF_NAME
+
+
+def agents_block(codex_home: Path) -> str:
+    return (
+        f"{AGENTS_BLOCK_BEGIN}\n"
+        "## Dreamers MCP Codex Stats\n"
+        "Apply this block only when the active Codex skill name starts with `dreamers-`.\n\n"
+        f"- Read and apply the `<{STATS_REF_TAG}>` block from `{agents_ref_path(codex_home)}` before continuing.\n"
+        "- Ignore this block for non-Dreamers work.\n"
+        "- If the ref file is missing, unreadable, or any stats command fails, continue normally. Stats are best-effort only.\n"
+        f"{AGENTS_BLOCK_END}\n"
+    )
+
+
+def manual_agents_instructions(codex_home: Path) -> str:
+    return "Manual AGENTS.md registration:\n" + agents_block(codex_home).strip()
+
+
 def install_hooks_config(codex_home: Path) -> tuple[bool, list[str]]:
     config_path = codex_home / HOOKS_CONFIG_RELATIVE
     warnings: list[str] = []
@@ -292,17 +333,27 @@ def manual_mcp_instructions(codex_home: Path, launcher_command: str, launcher_ar
     return "Manual MCP registration:\n" + mcp_block(codex_home, launcher_command, launcher_args).strip()
 
 
-def find_managed_block(text: str) -> tuple[int, int] | None:
-    start = text.find(MANAGED_BLOCK_BEGIN)
-    end = text.find(MANAGED_BLOCK_END)
+def find_managed_block(text: str, begin_marker: str, end_marker: str) -> tuple[int, int] | None:
+    start = text.find(begin_marker)
+    end = text.find(end_marker)
     if start == -1 and end == -1:
         return None
     if start == -1 or end == -1 or end < start:
         raise ValueError("managed block markers are malformed")
-    end_index = end + len(MANAGED_BLOCK_END)
+    end_index = end + len(end_marker)
     if end_index < len(text) and text[end_index:end_index + 1] == "\n":
         end_index += 1
     return start, end_index
+
+
+def strip_agents_block(text: str) -> str:
+    block_range = find_managed_block(text, AGENTS_BLOCK_BEGIN, AGENTS_BLOCK_END)
+    if block_range is None:
+        return text
+    start, end = block_range
+    if start == 0 and text[end:end + 1] == "\n":
+        end += 1
+    return text[:start] + text[end:]
 
 
 def install_mcp_config(codex_home: Path, launcher_command: str, launcher_args: list[str]) -> tuple[bool, list[str]]:
@@ -313,7 +364,7 @@ def install_mcp_config(codex_home: Path, launcher_command: str, launcher_args: l
     else:
         text = ""
     try:
-        block_range = find_managed_block(text)
+        block_range = find_managed_block(text, MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END)
     except ValueError as exc:
         warnings.append(f"Skipped config.toml merge: {exc}")
         warnings.append(manual_mcp_instructions(codex_home, launcher_command, launcher_args))
@@ -345,7 +396,7 @@ def remove_mcp_config(codex_home: Path) -> list[str]:
         return []
     text = config_path.read_text(encoding="utf-8")
     try:
-        block_range = find_managed_block(text)
+        block_range = find_managed_block(text, MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END)
     except ValueError as exc:
         return [f"Skipped config.toml cleanup: {exc}"]
     if block_range is None:
@@ -355,6 +406,41 @@ def remove_mcp_config(codex_home: Path) -> list[str]:
     updated = updated.strip()
     if updated:
         config_path.write_text(updated + "\n", encoding="utf-8")
+    else:
+        config_path.unlink()
+    return []
+
+
+def install_agents_config(codex_home: Path) -> tuple[bool, list[str]]:
+    config_path = codex_home / AGENTS_CONFIG_RELATIVE
+    warnings: list[str] = []
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    try:
+        remaining = strip_agents_block(text)
+    except ValueError as exc:
+        warnings.append(f"Skipped AGENTS.md merge: {exc}")
+        warnings.append(manual_agents_instructions(codex_home))
+        return False, warnings
+
+    block = agents_block(codex_home)
+    updated = block if not remaining else block + "\n" + remaining
+    config_path.write_text(updated, encoding="utf-8")
+    return True, warnings
+
+
+def remove_agents_config(codex_home: Path) -> list[str]:
+    config_path = codex_home / AGENTS_CONFIG_RELATIVE
+    if not config_path.exists():
+        return []
+    text = config_path.read_text(encoding="utf-8")
+    try:
+        updated = strip_agents_block(text)
+    except ValueError as exc:
+        return [f"Skipped AGENTS.md cleanup: {exc}"]
+    if updated == text:
+        return []
+    if updated:
+        config_path.write_text(updated, encoding="utf-8")
     else:
         config_path.unlink()
     return []
@@ -386,21 +472,25 @@ def install_bundle(
     if missing_keys:
         hook_configured = False
         mcp_configured = False
+        agents_configured = False
         hook_warnings = [
-            "Skipped hook and MCP configuration because required bundle assets were not installed cleanly: "
+            "Skipped hook, MCP, and AGENTS configuration because required bundle assets were not installed cleanly: "
             + ", ".join(missing_keys)
         ]
         mcp_warnings = []
+        agents_warnings = []
     else:
         hook_configured, hook_warnings = install_hooks_config(codex_home)
         mcp_configured, mcp_warnings = install_mcp_config(codex_home, launcher_command, launcher_args)
+        agents_configured, agents_warnings = install_agents_config(codex_home)
     write_manifest(codex_home, {"files": managed_files})
-    warnings = [*hook_warnings, *mcp_warnings]
+    warnings = [*hook_warnings, *mcp_warnings, *agents_warnings]
     manual_steps = [item for item in warnings if item.startswith("Manual ")]
     return InstallResult(
         installed_count=installed_count,
         hook_configured=hook_configured,
         mcp_configured=mcp_configured,
+        agents_configured=agents_configured,
         warnings=[item for item in warnings if not item.startswith("Manual ")],
         manual_steps=manual_steps,
     )
@@ -423,7 +513,7 @@ def remove_bundle(codex_home: Path) -> RemoveResult:
         removed_count += 1
         remove_empty_parents(codex_home, Path(relative_key))
 
-    warnings = [*remove_hooks_config(codex_home), *remove_mcp_config(codex_home)]
+    warnings = [*remove_hooks_config(codex_home), *remove_mcp_config(codex_home), *remove_agents_config(codex_home)]
 
     manifest_path = codex_home / INSTALL_STATE_RELATIVE
     if manifest_path.exists():
@@ -470,6 +560,8 @@ def main(argv: list[str] | None = None) -> int:
             print("Configured hooks.json with managed Dreamers entries.")
         if result.mcp_configured:
             print("Configured config.toml with managed Dreamers MCP entry.")
+        if result.agents_configured:
+            print("Configured AGENTS.md with managed Dreamers stats guidance.")
         for warning in result.warnings:
             print(f"WARNING: {warning}")
         for manual in result.manual_steps:
