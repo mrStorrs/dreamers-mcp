@@ -302,6 +302,58 @@ HOOK_EVENT_SPECS: dict[str, HookSpec] = {
             ),
         },
     },
+    "SessionStart": {
+        "event_type": "session_started",
+        "metrics": lambda payload: {
+            "session_source": hook_value(payload, "source"),
+            "initial_input_present": bool(hook_value(payload, "initialPrompt")),
+        },
+    },
+    "UserPromptSubmit": {
+        "event_type": "prompt_submitted",
+        "metrics": lambda payload: {
+            "prompt_count": 1,
+            "input_char_count": len(hook_value(payload, "prompt", default="")),
+            "starts_with_slash": hook_value(payload, "prompt", default="").lstrip().startswith("/"),
+        },
+    },
+    "PostToolUse": {
+        "event_type": "tool_completed",
+        "metrics": lambda payload: {
+            "tool_name": hook_value(payload, "toolName", "tool_name"),
+            "result_type": codex_result_type(payload),
+        },
+    },
+    "PreCompact": {
+        "event_type": "compaction_started",
+        "metrics": lambda payload: {
+            "trigger": hook_value(payload, "trigger"),
+            "instructions_present": bool(
+                hook_value(payload, "customInstructions", "custom_instructions")
+            ),
+        },
+    },
+    "SubagentStart": {
+        "event_type": "subagent_started",
+        "metrics": lambda payload: {
+            "agent_name": hook_value(payload, "agentName", "agent_name", "agent_type"),
+            "agent_display_name": hook_value(payload, "agentDisplayName", "agent_display_name", "agent_type"),
+        },
+    },
+    "SubagentStop": {
+        "event_type": "subagent_completed",
+        "metrics": lambda payload: {
+            "agent_name": hook_value(payload, "agentName", "agent_name", "agent_type"),
+            "agent_display_name": hook_value(payload, "agentDisplayName", "agent_display_name", "agent_type"),
+            "stop_reason": hook_value(payload, "stopReason", "stop_reason"),
+        },
+    },
+    "Stop": {
+        "event_type": "turn_completed",
+        "metrics": lambda payload: {
+            "stop_reason": hook_value(payload, "stopReason", "stop_reason"),
+        },
+    },
 }
 
 SKILL_EVENT_SPECS: dict[str, MetricSpec] = {
@@ -871,11 +923,58 @@ def build_hook_event(event_name: str, payload: dict[str, Any]) -> dict[str, Any]
         "repo_path": repo_path,
         "source": "hook",
         "status": resolve_hook_status(spec, payload, event_type),
-        "session_id": hook_value(payload, "sessionId", "session_id"),
+        "session_id": hook_value(payload, "sessionId", "session_id", "turn_id", "turnId"),
         "metrics": resolve_hook_spec_value(spec["metrics"], payload),
     }
     event["event_id"] = hook_event_id(event_name, event)
     return event
+
+
+def build_hook_events(event_name: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    primary = build_hook_event(event_name, payload)
+    events = [primary]
+    if event_name == "Stop":
+        events.append(build_unavailable_token_event(primary))
+    return events
+
+
+def build_unavailable_token_event(primary_event: dict[str, Any]) -> dict[str, Any]:
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": "",
+        "timestamp": primary_event["timestamp"],
+        "event_type": "token_usage_recorded",
+        "repo_path": primary_event["repo_path"],
+        "source": "summary",
+        "status": default_status_for_event("token_usage_recorded"),
+        "session_id": primary_event.get("session_id"),
+        "metrics": {
+            "token_source": "unavailable",
+            "attribution_scope": "turn",
+        },
+    }
+    raw = "|".join(
+        (
+            primary_event["event_id"],
+            event["timestamp"],
+            json.dumps(event["metrics"], sort_keys=True),
+        )
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    event["event_id"] = f"summary_token_usage_{digest}"
+    return event
+
+
+def codex_result_type(payload: dict[str, Any]) -> str:
+    for parent_key in ("toolResult", "tool_result", "toolResponse", "tool_response"):
+        parent = hook_value(payload, parent_key)
+        if not isinstance(parent, dict):
+            continue
+        for child_key in ("resultType", "result_type", "status"):
+            value = parent.get(child_key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return "success"
 
 
 def hook_event_id(event_name: str, event: dict[str, Any]) -> str:
@@ -2061,8 +2160,8 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
         try:
             payload = load_event(args, input_stream)
             context = resolve_args_context(args, payload=payload)
-            event = build_hook_event(args.event_name, payload)
-            record_event(event, client=context.client, home=context.home)
+            for event in build_hook_events(args.event_name, payload):
+                record_event(event, client=context.client, home=context.home)
         except json.JSONDecodeError:
             print("invalid_json", file=sys.stderr)
             return 2

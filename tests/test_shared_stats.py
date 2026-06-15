@@ -254,6 +254,129 @@ class SharedStatsTests(unittest.TestCase):
         self.assertNotIn("do not store", raw_line)
         self.assertNotIn("Bearer abc1234567890", raw_line)
 
+    def test_codex_hook_events_map_to_shared_schema_and_report_unavailable_tokens(self):
+        cases = [
+            (
+                "SessionStart",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_400_000,
+                    "source": "resume",
+                    "turn_id": "turn_01",
+                },
+                "session_started",
+            ),
+            (
+                "UserPromptSubmit",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_410_000,
+                    "prompt": "do not store prompt text",
+                    "turn_id": "turn_01",
+                },
+                "prompt_submitted",
+            ),
+            (
+                "PostToolUse",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_420_000,
+                    "tool_name": "Bash",
+                    "tool_use_id": "tool_01",
+                    "tool_input": {"command": "cat secret.txt"},
+                    "tool_response": {"output": "do not store tool output"},
+                    "turn_id": "turn_01",
+                },
+                "tool_completed",
+            ),
+            (
+                "PreCompact",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_430_000,
+                    "trigger": "auto",
+                    "turn_id": "turn_01",
+                },
+                "compaction_started",
+            ),
+            (
+                "SubagentStart",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_440_000,
+                    "agent_type": "probe",
+                    "agent_id": "agent_01",
+                    "turn_id": "turn_01",
+                },
+                "subagent_started",
+            ),
+            (
+                "SubagentStop",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_450_000,
+                    "agent_type": "probe",
+                    "agent_id": "agent_01",
+                    "last_assistant_message": "do not store assistant text",
+                    "turn_id": "turn_01",
+                },
+                "subagent_completed",
+            ),
+            (
+                "Stop",
+                {
+                    "cwd": "/tmp/example",
+                    "timestamp": 1_718_302_460_000,
+                    "stop_hook_active": False,
+                    "last_assistant_message": "do not store stop text",
+                    "turn_id": "turn_01",
+                },
+                "turn_completed",
+            ),
+        ]
+
+        for event_name, payload, event_type in cases:
+            with self.subTest(event_name=event_name):
+                code, stdout, stderr = self.invoke_hook(
+                    event_name,
+                    payload,
+                    "--client",
+                    "codex",
+                    "--home",
+                    str(self.codex_home),
+                )
+                self.assertEqual(0, code)
+                self.assertEqual("", stdout)
+                self.assertEqual("", stderr)
+
+        stored = self.read_events(self.codex_events)
+        stored_types = [event["event_type"] for event in stored if event["event_type"] != "token_usage_recorded"]
+        self.assertEqual(
+            [
+                "session_started",
+                "prompt_submitted",
+                "tool_completed",
+                "compaction_started",
+                "subagent_started",
+                "subagent_completed",
+                "turn_completed",
+            ],
+            stored_types,
+        )
+        raw_line = self.codex_events.read_text(encoding="utf-8")
+        self.assertNotIn("secret.txt", raw_line)
+        self.assertNotIn("do not store", raw_line)
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "codex", "--home", str(self.codex_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(0, report["exact"]["row_count"])
+        self.assertEqual(1, report["unavailable"]["row_count"])
+
     def test_checkpoint_validation_blocks_freeform_metrics(self):
         code, stdout, stderr = self.invoke_checkpoint(
             "gate_decided",
