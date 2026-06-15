@@ -1005,6 +1005,211 @@ class SharedStatsTests(unittest.TestCase):
                 self.assertEqual("", stderr)
                 assertion(json.loads(stdout))
 
+    def test_runs_report_includes_individual_run_stats(self):
+        events = [
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_start",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={"mode": "plan-path"},
+            ),
+            self.fixture_event(
+                "validation_attempt",
+                event_id="evt_run_detail_validation_fail",
+                timestamp="2026-06-13T10:01:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={
+                    "command_kind": "test",
+                    "command_label": "unittest",
+                    "attempt_number": 1,
+                    "result": "fail",
+                    "failure_category": "test-failure",
+                },
+            ),
+            self.fixture_event(
+                "validation_attempt",
+                event_id="evt_run_detail_validation_pass",
+                timestamp="2026-06-13T10:02:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={
+                    "command_kind": "test",
+                    "command_label": "unittest",
+                    "attempt_number": 2,
+                    "result": "pass",
+                },
+            ),
+            self.fixture_event(
+                "gate_decided",
+                event_id="evt_run_detail_gate",
+                timestamp="2026-06-13T10:03:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={"gate_type": "plan-approval", "decision": "approved"},
+            ),
+            self.fixture_event(
+                "review_pass_completed",
+                event_id="evt_run_detail_review",
+                timestamp="2026-06-13T10:04:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={
+                    "review_pass_id": "review_run_detail_01",
+                    "lane": "full",
+                    "reviewers": ["sentinel"],
+                    "artifact_paths": [],
+                    "findings_by_severity": {"critical": 0, "high": 1, "medium": 0, "low": 0},
+                    "findings_by_lens": {"correctness": 1, "security": 0, "maintainability": 0, "test-coverage": 0, "simplicity": 0},
+                    "blocked": False,
+                    "open_question_count": 1,
+                },
+            ),
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_tokens",
+                timestamp="2026-06-13T10:05:00Z",
+                run_id="run_detail_01",
+                session_id="sess_run_detail_01",
+                skill="dreamers-full",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "session",
+                    "input_tokens": 30,
+                    "output_tokens": 12,
+                    "total_tokens": 42,
+                    "ai_credits": 0.5,
+                },
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_completed",
+                timestamp="2026-06-13T10:06:00Z",
+                run_id="run_detail_01",
+                skill="dreamers-full",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_other_start",
+                timestamp="2026-06-13T11:00:00Z",
+                run_id="run_detail_02",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event)
+
+        report = runtime.run_report(
+            "runs",
+            client="copilot",
+            home=self.copilot_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(2, report["run_count"])
+        items = {item["run_id"]: item for item in report["items"]}
+        run = items["run_detail_01"]
+        self.assertEqual("completed", run["status"])
+        self.assertEqual(360, run["duration_seconds"])
+        self.assertEqual("2026-06-13T10:00:00Z", run["first_timestamp"])
+        self.assertEqual("2026-06-13T10:06:00Z", run["last_timestamp"])
+        self.assertEqual(2, run["validation"]["attempt_count"])
+        self.assertEqual(1, run["validation"]["command_kinds"]["test"]["retry_count"])
+        self.assertEqual({"approved": 1}, run["gates"]["decision_counts"]["plan-approval"])
+        self.assertEqual(1, run["reviews"]["review_count"])
+        self.assertEqual(1, run["reviews"]["findings_by_severity"]["high"])
+        self.assertEqual(42, run["tokens"]["exact"]["totals"]["total_tokens"])
+
+    def test_runs_report_correlates_hook_token_events_by_unique_session(self):
+        session_id = "session_run_detail_hook"
+        self.write_codex_session_lines(
+            session_id,
+            [
+                {
+                    "timestamp": "2026-06-15T10:04:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 80,
+                                "output_tokens": 20,
+                                "total_tokens": 100,
+                            },
+                            "model": "gpt-5",
+                        },
+                    },
+                },
+            ],
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_hook_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_detail_hook_01",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_hook_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_detail_hook_01",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        code, stdout, stderr = self.invoke_hook(
+            "Stop",
+            {
+                "cwd": str(self.fixture_repo),
+                "timestamp": "2026-06-15T10:05:00Z",
+                "session_id": session_id,
+                "stop_hook_active": False,
+            },
+            "--client",
+            "codex",
+            "--home",
+            str(self.codex_home),
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        token_events = [
+            event for event in self.read_events(self.codex_events)
+            if event["event_type"] == "token_usage_recorded"
+        ]
+        self.assertEqual(1, len(token_events))
+        self.assertIsNone(token_events[0]["run_id"])
+        self.assertIsNone(token_events[0]["skill"])
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertEqual(100, items["run_detail_hook_01"]["tokens"]["exact"]["totals"]["total_tokens"])
+
     def test_dashboard_command_writes_standalone_html_file(self):
         self.record_fixture_event(
             self.fixture_event(
@@ -1063,6 +1268,7 @@ class SharedStatsTests(unittest.TestCase):
         self.assertIn("Gates", html_text)
         self.assertIn("Tokens", html_text)
         self.assertIn("dreamers-full", html_text)
+        self.assertIn("Run details", html_text)
 
         code, stdout, stderr = self.invoke(
             [
@@ -1082,6 +1288,101 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("", stderr)
         self.assertEqual(html_text, stdout)
+
+    def test_dashboard_cli_renders_expandable_individual_run_details(self):
+        events = [
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_dashboard_detail_start",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_dashboard_detail_01",
+                skill="dreamers-full",
+                metrics={"mode": "plan-path"},
+            ),
+            self.fixture_event(
+                "validation_attempt",
+                event_id="evt_dashboard_detail_validation",
+                timestamp="2026-06-13T10:01:00Z",
+                run_id="run_dashboard_detail_01",
+                skill="dreamers-full",
+                metrics={
+                    "command_kind": "test",
+                    "command_label": "unittest",
+                    "attempt_number": 1,
+                    "result": "pass",
+                },
+            ),
+            self.fixture_event(
+                "gate_decided",
+                event_id="evt_dashboard_detail_gate",
+                timestamp="2026-06-13T10:02:00Z",
+                run_id="run_dashboard_detail_01",
+                skill="dreamers-full",
+                metrics={"gate_type": "plan-approval", "decision": "approved"},
+            ),
+            self.fixture_event(
+                "review_pass_completed",
+                event_id="evt_dashboard_detail_review",
+                timestamp="2026-06-13T10:03:00Z",
+                run_id="run_dashboard_detail_01",
+                skill="dreamers-full",
+                metrics={
+                    "review_pass_id": "review_dashboard_detail_01",
+                    "lane": "full",
+                    "reviewers": ["sentinel"],
+                    "artifact_paths": [],
+                    "findings_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                    "findings_by_lens": {"correctness": 0, "security": 0, "maintainability": 0, "test-coverage": 0, "simplicity": 0},
+                    "blocked": False,
+                    "open_question_count": 0,
+                },
+            ),
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_dashboard_detail_tokens",
+                timestamp="2026-06-13T10:04:00Z",
+                run_id="run_dashboard_detail_01",
+                session_id="sess_dashboard_detail_01",
+                skill="dreamers-full",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "session",
+                    "input_tokens": 30,
+                    "output_tokens": 12,
+                    "total_tokens": 42,
+                    "ai_credits": 0.5,
+                },
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_dashboard_detail_completed",
+                timestamp="2026-06-13T10:05:00Z",
+                run_id="run_dashboard_detail_01",
+                skill="dreamers-full",
+                metrics={"final_status": "completed"},
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event)
+
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn('<section class="panel run-details"><h2>Run details</h2>', stdout)
+        self.assertIn('<details class="run-detail">', stdout)
+        self.assertIn("run_dashboard_detail_01", stdout)
+        self.assertIn("<dt>validation attempts</dt><dd>1</dd>", stdout)
+        self.assertIn("<dt>gate decisions</dt><dd>1</dd>", stdout)
+        self.assertIn("<dt>review passes</dt><dd>1</dd>", stdout)
+        self.assertIn("<dt>token total</dt><dd>42</dd>", stdout)
+        self.assertIn("<dt>first seen</dt><dd>Jun 13, 2026 10:00 UTC</dd>", stdout)
+        self.assertIn("<dt>last seen</dt><dd>Jun 13, 2026 10:05 UTC</dd>", stdout)
 
     def test_dashboard_formats_values_timestamps_and_status_badges(self):
         events = [
