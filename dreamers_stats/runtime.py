@@ -978,9 +978,15 @@ def load_codex_session_token_metrics(
     sessions_root = Path(home).expanduser() / "sessions"
     if not sessions_root.is_dir():
         return None
+    target_timestamp = None
+    if timestamp:
+        try:
+            target_timestamp = parse_iso_timestamp(timestamp).astimezone(UTC)
+        except StatsValidationError:
+            target_timestamp = None
     candidates = codex_session_candidate_paths(sessions_root, normalized_session_id, timestamp)
     for candidate in candidates:
-        metrics = read_codex_session_token_metrics(candidate)
+        metrics = read_codex_session_token_metrics_at(candidate, target_timestamp=target_timestamp)
         if metrics is not None:
             return metrics
     return None
@@ -1069,19 +1075,35 @@ def safe_path_mtime(path: Path) -> float:
 
 
 def read_codex_session_token_metrics(path: Path) -> dict[str, Any] | None:
+    return read_codex_session_token_metrics_at(path)
+
+
+def read_codex_session_token_metrics_at(path: Path, target_timestamp: datetime | None = None) -> dict[str, Any] | None:
     latest_metrics: dict[str, Any] | None = None
+    latest_matching_metrics: dict[str, Any] | None = None
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
-                metrics = codex_session_line_token_metrics(line)
-                if metrics is not None:
-                    latest_metrics = metrics
+                record = codex_session_line_token_record(line)
+                if record is None:
+                    continue
+                timestamp, metrics = record
+                latest_metrics = metrics
+                if target_timestamp is None or timestamp is None or timestamp <= target_timestamp:
+                    latest_matching_metrics = metrics
     except (OSError, UnicodeDecodeError):
         return None
-    return latest_metrics
+    return latest_matching_metrics or latest_metrics
 
 
 def codex_session_line_token_metrics(line: str) -> dict[str, Any] | None:
+    record = codex_session_line_token_record(line)
+    if record is None:
+        return None
+    return record[1]
+
+
+def codex_session_line_token_record(line: str) -> tuple[datetime | None, dict[str, Any]] | None:
     try:
         row = json.loads(line)
     except json.JSONDecodeError:
@@ -1097,7 +1119,16 @@ def codex_session_line_token_metrics(line: str) -> dict[str, Any] | None:
     usage = info.get("last_token_usage")
     if not isinstance(usage, dict):
         return None
-    return codex_usage_token_metrics(usage, info)
+    metrics = codex_usage_token_metrics(usage, info)
+    if metrics is None:
+        return None
+    timestamp = None
+    if isinstance(row.get("timestamp"), str):
+        try:
+            timestamp = parse_iso_timestamp(row["timestamp"]).astimezone(UTC)
+        except StatsValidationError:
+            timestamp = None
+    return timestamp, metrics
 
 
 def codex_usage_token_metrics(usage: dict[str, Any], info: dict[str, Any]) -> dict[str, Any] | None:
@@ -1429,6 +1460,41 @@ def load_report_events(
             continue
         events.append(normalized)
     return events, warning_count
+
+
+def resolve_codex_report_token_events(events: list[dict[str, Any]], *, client: str | None, home: str | Path | None) -> list[dict[str, Any]]:
+    if client != "codex" or home is None:
+        return events
+    resolved_events = []
+    token_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+    for event in events:
+        if not is_unavailable_token_event(event):
+            resolved_events.append(event)
+            continue
+        session_id = event.get("session_id")
+        timestamp = event.get("timestamp")
+        if not isinstance(session_id, str) or not isinstance(timestamp, str):
+            resolved_events.append(event)
+            continue
+        cache_key = (session_id, timestamp)
+        if cache_key not in token_cache:
+            token_cache[cache_key] = load_codex_session_token_metrics(home, session_id, timestamp=timestamp)
+        exact_metrics = token_cache[cache_key]
+        if exact_metrics is None:
+            resolved_events.append(event)
+            continue
+        resolved = dict(event)
+        resolved["metrics"] = dict(exact_metrics)
+        resolved_events.append(resolved)
+    return resolved_events
+
+
+def is_unavailable_token_event(event: dict[str, Any]) -> bool:
+    return (
+        event.get("event_type") == "token_usage_recorded"
+        and isinstance(event.get("metrics"), dict)
+        and event["metrics"].get("token_source") == "unavailable"
+    )
 
 
 def normalize_report_event(payload: Any) -> dict[str, Any] | None:
@@ -2409,6 +2475,7 @@ def run_report(
     cwd: str | Path | None = None,
 ) -> dict[str, Any]:
     events, warning_count = load_report_events(client=client, home=home)
+    events = resolve_codex_report_token_events(events, client=client, home=home)
     filters = build_report_filters(repo=repo, skill=skill, since=since, until=until, cwd=cwd)
     filtered = filter_report_events(events, filters)
     return REPORT_BUILDERS[command](filtered, warning_count, filters)

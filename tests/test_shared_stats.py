@@ -537,6 +537,70 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(1, len(token_events))
         self.assertEqual(123, token_events[0]["metrics"]["total_tokens"])
 
+    def test_codex_reports_resolve_unavailable_tokens_from_session_log(self):
+        self.write_codex_session_lines(
+            "session_report",
+            [
+                {
+                    "timestamp": "2026-06-15T00:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 80,
+                                "cached_input_tokens": 40,
+                                "output_tokens": 20,
+                                "total_tokens": 100,
+                            }
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:10Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 900,
+                                "cached_input_tokens": 800,
+                                "output_tokens": 99,
+                                "total_tokens": 999,
+                            }
+                        },
+                    },
+                },
+            ],
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_report_unavailable_tokens",
+                timestamp="2026-06-15T00:00:05Z",
+                session_id="session_report",
+                source="summary",
+                metrics={"token_source": "unavailable", "attribution_scope": "turn"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "codex", "--home", str(self.codex_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(1, report["exact"]["row_count"])
+        self.assertEqual(0, report["unavailable"]["row_count"])
+        self.assertEqual(100, report["exact"]["totals"]["total_tokens"])
+        self.assertEqual(40, report["exact"]["totals"]["cache_read_tokens"])
+        raw_line = self.codex_events.read_text(encoding="utf-8")
+        self.assertIn('"token_source":"unavailable"', raw_line)
+
     def test_codex_hook_events_accept_docs_shaped_payloads_without_timestamp(self):
         before = datetime.now(tz=UTC)
         cases = [
