@@ -1782,19 +1782,207 @@ def merge_count_dicts(target: dict[str, int], source: dict[str, Any], keys: Iter
         target[key] += int(source.get(key, 0) or 0)
 
 
+def run_key_for_event(event: dict[str, Any]) -> tuple[str, str, str] | None:
+    run_id = event.get("run_id")
+    skill = event.get("skill")
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    if not isinstance(skill, str) or not skill:
+        return None
+    return (run_id, event["repo_path"], skill)
+
+
+def summarize_validation_events(validation_events: list[dict[str, Any]]) -> dict[str, Any]:
+    command_kinds: dict[str, dict[str, int]] = {}
+    final_attempts: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for event in validation_events:
+        metrics = event["metrics"]
+        kind = metrics.get("command_kind")
+        label = metrics.get("command_label")
+        if not isinstance(kind, str) or not isinstance(label, str):
+            continue
+        stats = command_kinds.setdefault(
+            kind,
+            {
+                "attempt_count": 0,
+                "failure_count": 0,
+                "retry_count": 0,
+                "final_pass_count": 0,
+                "final_fail_count": 0,
+            },
+        )
+        stats["attempt_count"] += 1
+        if metrics["result"] == "fail":
+            stats["failure_count"] += 1
+        if int(metrics.get("attempt_number", 0) or 0) > 1:
+            stats["retry_count"] += 1
+        key = (
+            event.get("run_id"),
+            event.get("repo_path"),
+            kind,
+            label,
+            metrics.get("scope"),
+            metrics.get("plan_path"),
+        )
+        previous = final_attempts.get(key)
+        if previous is None or should_replace_validation_attempt(previous, event):
+            final_attempts[key] = event
+
+    for event in final_attempts.values():
+        kind = event["metrics"]["command_kind"]
+        result = event["metrics"].get("result")
+        if result == "pass":
+            command_kinds[kind]["final_pass_count"] += 1
+        elif result == "fail":
+            command_kinds[kind]["final_fail_count"] += 1
+    return {
+        "attempt_count": len(validation_events),
+        "command_kinds": dict(sorted(command_kinds.items())),
+    }
+
+
+def summarize_gate_events(gate_events: list[dict[str, Any]]) -> dict[str, Any]:
+    gate_type_counts: Counter[str] = Counter()
+    decision_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    for event in gate_events:
+        gate_type = event["metrics"]["gate_type"]
+        decision = event["metrics"]["decision"]
+        gate_type_counts[gate_type] += 1
+        decision_counts[gate_type][decision] += 1
+    return {
+        "gate_type_counts": dict(sorted(gate_type_counts.items())),
+        "decision_counts": {
+            gate_type: dict(sorted(counter.items()))
+            for gate_type, counter in sorted(decision_counts.items())
+        },
+    }
+
+
+def summarize_review_events(review_events: list[dict[str, Any]]) -> dict[str, Any]:
+    lane_counts: Counter[str] = Counter()
+    reviewer_counts: Counter[str] = Counter()
+    trigger_counts: Counter[str] = Counter()
+    findings_by_severity = empty_count_dict(FINDING_SEVERITY_ORDER)
+    findings_by_lens = empty_count_dict(FINDING_LENS_ORDER)
+    initial_review_count = 0
+    rereview_count = 0
+    blocked_count = 0
+    open_question_count = 0
+    artifact_cache: dict[str, dict[str, Any]] = {}
+    parsed_artifact_paths: set[str] = set()
+    missing_artifact_paths: set[str] = set()
+    mismatches: list[dict[str, Any]] = []
+
+    for event in review_events:
+        metrics = event["metrics"]
+        lane = metrics.get("lane")
+        if isinstance(lane, str) and lane:
+            lane_counts[lane] += 1
+        reviewers = metrics.get("reviewers", [])
+        if isinstance(reviewers, list):
+            reviewer_counts.update([reviewer for reviewer in reviewers if isinstance(reviewer, str)])
+
+        is_rereview = bool(metrics.get("is_rereview"))
+        if is_rereview:
+            rereview_count += 1
+            trigger = metrics.get("trigger")
+            if isinstance(trigger, str) and trigger:
+                trigger_counts[trigger] += 1
+        else:
+            initial_review_count += 1
+
+        event_artifacts = resolve_review_artifacts(event)
+        event_missing = False
+        artifact_aggregate = {
+            "blocked": False,
+            "open_question_count": 0,
+            "findings_by_severity": empty_count_dict(FINDING_SEVERITY_ORDER),
+            "findings_by_lens": empty_count_dict(FINDING_LENS_ORDER),
+        }
+        for artifact_path in event_artifacts:
+            parsed = artifact_cache.get(str(artifact_path))
+            if parsed is None:
+                parsed = parse_review_artifact(artifact_path)
+                artifact_cache[str(artifact_path)] = parsed
+            if not parsed["found"]:
+                event_missing = True
+                missing_artifact_paths.add(str(artifact_path))
+                continue
+            parsed_artifact_paths.add(str(artifact_path))
+            if parsed["blocked"]:
+                artifact_aggregate["blocked"] = True
+            merge_count_dicts(
+                artifact_aggregate["findings_by_severity"],
+                parsed["findings_by_severity"],
+                FINDING_SEVERITY_ORDER,
+            )
+            merge_count_dicts(
+                artifact_aggregate["findings_by_lens"],
+                parsed["findings_by_lens"],
+                FINDING_LENS_ORDER,
+            )
+            artifact_aggregate["open_question_count"] += parsed["open_question_count"]
+        count_source = artifact_aggregate if event_artifacts and not event_missing else metrics
+        if bool(count_source.get("blocked")):
+            blocked_count += 1
+        open_question_count += int(count_source.get("open_question_count", 0) or 0)
+        merge_count_dicts(findings_by_severity, count_source.get("findings_by_severity", {}), FINDING_SEVERITY_ORDER)
+        merge_count_dicts(findings_by_lens, count_source.get("findings_by_lens", {}), FINDING_LENS_ORDER)
+
+        if event_artifacts and not event_missing and review_event_has_artifact_mismatch(metrics, artifact_aggregate):
+            mismatches.append(
+                {
+                    "review_pass_id": metrics.get("review_pass_id"),
+                    "artifact_paths": [str(path) for path in event_artifacts],
+                }
+            )
+
+    return {
+        "review_count": len(review_events),
+        "initial_review_count": initial_review_count,
+        "rereview_count": rereview_count,
+        "lane_counts": dict(lane_counts),
+        "reviewer_counts": dict(reviewer_counts),
+        "blocked_count": blocked_count,
+        "open_question_count": open_question_count,
+        "findings_by_severity": findings_by_severity,
+        "findings_by_lens": findings_by_lens,
+        "rereview_trigger_counts": dict(trigger_counts),
+        "artifact_summary": {
+            "parsed_count": len(parsed_artifact_paths),
+            "missing_count": len(missing_artifact_paths),
+            "mismatch_count": len(mismatches),
+            "mismatches": mismatches,
+        },
+    }
+
+
+def summarize_token_events(token_events: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "exact": summarize_token_source("exact", token_events),
+        "estimated": summarize_token_source("estimated", token_events),
+        "unavailable": summarize_token_source("unavailable", token_events),
+    }
+
+
 def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     runs: dict[tuple[str, str, str], dict[str, Any]] = {}
+    events_by_run: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    run_keys_by_session: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
     for event in events:
-        run_id = event.get("run_id")
-        skill = event.get("skill")
-        if not run_id or not skill:
+        run_key = run_key_for_event(event)
+        if run_key is None:
             continue
-        run_key = (run_id, event["repo_path"], skill)
+        run_id, repo_path, skill = run_key
+        events_by_run[run_key].append(event)
+        session_id = event.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            run_keys_by_session[(repo_path, session_id)].add(run_key)
         run = runs.setdefault(
             run_key,
             {
                 "run_id": run_id,
-                "repo_path": event["repo_path"],
+                "repo_path": repo_path,
                 "skill": skill,
                 "status": "in_progress",
                 "first_timestamp": event["_parsed_timestamp"],
@@ -1813,6 +2001,16 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
         elif event["event_type"] == "skill_halted":
             run["end_timestamp"] = event["_parsed_timestamp"]
             run["status"] = event.get("status") or "halted"
+
+    for event in events:
+        if event["event_type"] != "token_usage_recorded" or run_key_for_event(event) is not None:
+            continue
+        session_id = event.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        candidate_keys = run_keys_by_session.get((event["repo_path"], session_id), set())
+        if len(candidate_keys) == 1:
+            events_by_run[next(iter(candidate_keys))].append(event)
 
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for run in runs.values():
@@ -1855,6 +2053,40 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
             }
         )
 
+    run_items = []
+    for run_key, run in runs.items():
+        start_timestamp = run["start_timestamp"] or run["first_timestamp"]
+        end_timestamp = run["end_timestamp"] or run["last_timestamp"]
+        duration_seconds = int((end_timestamp - start_timestamp).total_seconds())
+        duration_seconds = max(duration_seconds, 0)
+        run_events = events_by_run[run_key]
+        run_items.append(
+            {
+                "run_id": run["run_id"],
+                "repo_path": run["repo_path"],
+                "skill": run["skill"],
+                "status": run["status"],
+                "duration_seconds": duration_seconds,
+                "first_timestamp": datetime_to_iso(run["first_timestamp"]),
+                "last_timestamp": datetime_to_iso(run["last_timestamp"]),
+                "start_timestamp": datetime_to_iso(run["start_timestamp"]),
+                "end_timestamp": datetime_to_iso(run["end_timestamp"]),
+                "validation": summarize_validation_events(
+                    [event for event in run_events if event["event_type"] == "validation_attempt"]
+                ),
+                "gates": summarize_gate_events(
+                    [event for event in run_events if event["event_type"] == "gate_decided"]
+                ),
+                "reviews": summarize_review_events(
+                    [event for event in run_events if event["event_type"] == "review_pass_completed"]
+                ),
+                "tokens": summarize_token_events(
+                    [event for event in run_events if event["event_type"] == "token_usage_recorded"]
+                ),
+            }
+        )
+    run_items.sort(key=lambda item: (item["last_timestamp"] or "", item["run_id"]), reverse=True)
+
     run_range = {"first_timestamp": None, "last_timestamp": None}
     if runs:
         run_range = {
@@ -1868,6 +2100,7 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
         "run_count": len(runs),
         "range": run_range,
         "groups": group_rows,
+        "items": run_items,
     }
 
 
@@ -1968,158 +2201,24 @@ def review_event_has_artifact_mismatch(metrics: dict[str, Any], parsed: dict[str
 
 def build_reviews_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     review_events = [event for event in events if event["event_type"] == "review_pass_completed"]
-    lane_counts: Counter[str] = Counter()
-    reviewer_counts: Counter[str] = Counter()
-    trigger_counts: Counter[str] = Counter()
-    findings_by_severity = empty_count_dict(FINDING_SEVERITY_ORDER)
-    findings_by_lens = empty_count_dict(FINDING_LENS_ORDER)
-    initial_review_count = 0
-    rereview_count = 0
-    blocked_count = 0
-    open_question_count = 0
-    artifact_cache: dict[str, dict[str, Any]] = {}
-    parsed_artifact_paths: set[str] = set()
-    missing_artifact_paths: set[str] = set()
-    mismatches: list[dict[str, Any]] = []
-
-    for event in review_events:
-        metrics = event["metrics"]
-        lane = metrics.get("lane")
-        if isinstance(lane, str) and lane:
-            lane_counts[lane] += 1
-        reviewers = metrics.get("reviewers", [])
-        if isinstance(reviewers, list):
-            reviewer_counts.update([reviewer for reviewer in reviewers if isinstance(reviewer, str)])
-
-        is_rereview = bool(metrics.get("is_rereview"))
-        if is_rereview:
-            rereview_count += 1
-            trigger = metrics.get("trigger")
-            if isinstance(trigger, str) and trigger:
-                trigger_counts[trigger] += 1
-        else:
-            initial_review_count += 1
-
-        event_artifacts = resolve_review_artifacts(event)
-        event_missing = False
-        artifact_aggregate = {
-            "blocked": False,
-            "open_question_count": 0,
-            "findings_by_severity": empty_count_dict(FINDING_SEVERITY_ORDER),
-            "findings_by_lens": empty_count_dict(FINDING_LENS_ORDER),
-        }
-        for artifact_path in event_artifacts:
-            parsed = artifact_cache.get(str(artifact_path))
-            if parsed is None:
-                parsed = parse_review_artifact(artifact_path)
-                artifact_cache[str(artifact_path)] = parsed
-            if not parsed["found"]:
-                event_missing = True
-                missing_artifact_paths.add(str(artifact_path))
-                continue
-            parsed_artifact_paths.add(str(artifact_path))
-            if parsed["blocked"]:
-                artifact_aggregate["blocked"] = True
-            merge_count_dicts(
-                artifact_aggregate["findings_by_severity"],
-                parsed["findings_by_severity"],
-                FINDING_SEVERITY_ORDER,
-            )
-            merge_count_dicts(
-                artifact_aggregate["findings_by_lens"],
-                parsed["findings_by_lens"],
-                FINDING_LENS_ORDER,
-            )
-            artifact_aggregate["open_question_count"] += parsed["open_question_count"]
-        count_source = artifact_aggregate if event_artifacts and not event_missing else metrics
-        if bool(count_source.get("blocked")):
-            blocked_count += 1
-        open_question_count += int(count_source.get("open_question_count", 0) or 0)
-        merge_count_dicts(findings_by_severity, count_source.get("findings_by_severity", {}), FINDING_SEVERITY_ORDER)
-        merge_count_dicts(findings_by_lens, count_source.get("findings_by_lens", {}), FINDING_LENS_ORDER)
-
-        if event_artifacts and not event_missing and review_event_has_artifact_mismatch(metrics, artifact_aggregate):
-            mismatches.append(
-                {
-                    "review_pass_id": metrics.get("review_pass_id"),
-                    "artifact_paths": [str(path) for path in event_artifacts],
-                }
-            )
-
+    summary = summarize_review_events(review_events)
     return {
         "report_type": "reviews",
         "warning_count": warning_count,
         "filters": report_filters_public(filters),
-        "review_count": len(review_events),
-        "initial_review_count": initial_review_count,
-        "rereview_count": rereview_count,
-        "lane_counts": dict(lane_counts),
-        "reviewer_counts": dict(reviewer_counts),
-        "blocked_count": blocked_count,
-        "open_question_count": open_question_count,
-        "findings_by_severity": findings_by_severity,
-        "findings_by_lens": findings_by_lens,
-        "rereview_trigger_counts": dict(trigger_counts),
-        "artifact_summary": {
-            "parsed_count": len(parsed_artifact_paths),
-            "missing_count": len(missing_artifact_paths),
-            "mismatch_count": len(mismatches),
-            "mismatches": mismatches,
-        },
+        **summary,
         "range": event_range(review_events),
     }
 
 
 def build_validation_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     validation_events = [event for event in events if event["event_type"] == "validation_attempt"]
-    command_kinds: dict[str, dict[str, int]] = {}
-    final_attempts: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for event in validation_events:
-        metrics = event["metrics"]
-        kind = metrics.get("command_kind")
-        label = metrics.get("command_label")
-        if not isinstance(kind, str) or not isinstance(label, str):
-            continue
-        stats = command_kinds.setdefault(
-            kind,
-            {
-                "attempt_count": 0,
-                "failure_count": 0,
-                "retry_count": 0,
-                "final_pass_count": 0,
-                "final_fail_count": 0,
-            },
-        )
-        stats["attempt_count"] += 1
-        if metrics["result"] == "fail":
-            stats["failure_count"] += 1
-        if int(metrics.get("attempt_number", 0) or 0) > 1:
-            stats["retry_count"] += 1
-        key = (
-            event.get("run_id"),
-            event.get("repo_path"),
-            kind,
-            label,
-            metrics.get("scope"),
-            metrics.get("plan_path"),
-        )
-        previous = final_attempts.get(key)
-        if previous is None or should_replace_validation_attempt(previous, event):
-            final_attempts[key] = event
-
-    for event in final_attempts.values():
-        kind = event["metrics"]["command_kind"]
-        result = event["metrics"].get("result")
-        if result == "pass":
-            command_kinds[kind]["final_pass_count"] += 1
-        elif result == "fail":
-            command_kinds[kind]["final_fail_count"] += 1
+    summary = summarize_validation_events(validation_events)
     return {
         "report_type": "validation",
         "warning_count": warning_count,
         "filters": report_filters_public(filters),
-        "attempt_count": len(validation_events),
-        "command_kinds": command_kinds,
+        **summary,
         "range": event_range(validation_events),
     }
 
@@ -2134,22 +2233,12 @@ def should_replace_validation_attempt(previous: dict[str, Any], candidate: dict[
 
 def build_gates_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     gate_events = [event for event in events if event["event_type"] == "gate_decided"]
-    gate_type_counts: Counter[str] = Counter()
-    decision_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for event in gate_events:
-        gate_type = event["metrics"]["gate_type"]
-        decision = event["metrics"]["decision"]
-        gate_type_counts[gate_type] += 1
-        decision_counts[gate_type][decision] += 1
+    summary = summarize_gate_events(gate_events)
     return {
         "report_type": "gates",
         "warning_count": warning_count,
         "filters": report_filters_public(filters),
-        "gate_type_counts": dict(sorted(gate_type_counts.items())),
-        "decision_counts": {
-            gate_type: dict(sorted(counter.items()))
-            for gate_type, counter in sorted(decision_counts.items())
-        },
+        **summary,
         "range": event_range(gate_events),
     }
 
@@ -2226,9 +2315,7 @@ def build_tokens_report(events: list[dict[str, Any]], warning_count: int, filter
         "report_type": "tokens",
         "warning_count": warning_count,
         "filters": report_filters_public(filters),
-        "exact": summarize_token_source("exact", token_events),
-        "estimated": summarize_token_source("estimated", token_events),
-        "unavailable": summarize_token_source("unavailable", token_events),
+        **summarize_token_events(token_events),
         "range": event_range(token_events),
     }
 
@@ -2492,6 +2579,91 @@ def dashboard_token_metric(tokens: dict[str, Any]) -> tuple[Any, str]:
     return 0, "exact total"
 
 
+def html_run_detail_section(runs: dict[str, Any]) -> str:
+    run_items = runs.get("items", [])
+    if not run_items:
+        return (
+            '<section class="panel run-details"><h2>Run details</h2>'
+            '<p class="empty">no runs matched these filters</p></section>'
+        )
+
+    details = []
+    for run in run_items:
+        validation = run["validation"]
+        gates = run["gates"]
+        reviews = run["reviews"]
+        token_value, token_detail = dashboard_token_metric(run["tokens"])
+        gate_count = sum(gates["gate_type_counts"].values())
+        validation_failures = sum(
+            summary["failure_count"] for summary in validation["command_kinds"].values()
+        )
+        validation_rows = [
+            [
+                kind,
+                summary["attempt_count"],
+                summary["failure_count"],
+                summary["retry_count"],
+                summary["final_pass_count"],
+                summary["final_fail_count"],
+            ]
+            for kind, summary in validation["command_kinds"].items()
+        ]
+        gate_rows = [
+            [
+                gate_type,
+                total,
+                format_dashboard_counter_map(gates["decision_counts"].get(gate_type, {})) or "none",
+            ]
+            for gate_type, total in gates["gate_type_counts"].items()
+        ]
+        details.append(
+            "".join(
+                [
+                    '<details class="run-detail">',
+                    "<summary>",
+                    f'<span class="run-id">{html_text(run["run_id"])}</span>',
+                    f'<span>{html_text(run["skill"])}</span>',
+                    str(html_status_badge(run["status"])),
+                    f'<span>{html_text(format_duration(run["duration_seconds"]))}</span>',
+                    "</summary>",
+                    '<div class="run-detail-body">',
+                    html_definition_list(
+                        [
+                            ("first seen", format_dashboard_timestamp(run["first_timestamp"])),
+                            ("last seen", format_dashboard_timestamp(run["last_timestamp"])),
+                            ("validation attempts", validation["attempt_count"]),
+                            ("validation failures", validation_failures),
+                            ("gate decisions", gate_count),
+                            ("review passes", reviews["review_count"]),
+                            ("open questions", reviews["open_question_count"]),
+                            ("token total", token_value),
+                            ("token source", token_detail),
+                        ]
+                    ),
+                    '<div class="run-detail-grid">',
+                    '<section><h3>Validation</h3>',
+                    html_table(
+                        ["Kind", "Attempts", "Failures", "Retries", "Final passes", "Final failures"],
+                        validation_rows,
+                        "no validation attempts",
+                    ),
+                    "</section>",
+                    '<section><h3>Gates</h3>',
+                    html_table(
+                        ["Gate", "Total", "Decisions"],
+                        gate_rows,
+                        "no gate decisions",
+                    ),
+                    "</section>",
+                    "</div>",
+                    "</div>",
+                    "</details>",
+                ]
+            )
+        )
+    return '<section class="panel run-details"><h2>Run details</h2>' + "".join(details) + "</section>"
+
+
 def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: str | None = None) -> str:
     generated = generated_at or utc_now_iso()
     runs = report["runs"]
@@ -2592,6 +2764,7 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             "table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 6px;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase}",
             ".status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:#eef3f0;color:var(--muted)}.status-completed{background:#e6f4eb;color:var(--ok)}.status-in-progress{background:#e8f1fb;color:var(--active)}.status-halted{background:#fff0e6;color:var(--hold)}",
             "dl{display:grid;gap:8px;margin:0}dl div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:6px 0}dt{color:var(--muted)}dd{margin:0;text-align:right}.empty{color:var(--muted)}",
+            ".run-detail{border:1px solid var(--line);border-radius:8px;margin:10px 0;background:#fbfdfb}.run-detail summary{cursor:pointer;display:grid;grid-template-columns:minmax(180px,1fr) minmax(120px,.7fr) auto auto;gap:12px;align-items:center;padding:12px 14px}.run-id{font-weight:700}.run-detail-body{padding:0 14px 14px}.run-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px}.run-detail h3{font-size:14px;margin:0 0 8px;color:var(--muted);text-transform:uppercase}@media(max-width:700px){.run-detail summary{grid-template-columns:1fr}}",
             "</style>",
             "</head>",
             "<body>",
@@ -2617,6 +2790,7 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
                 "no runs matched these filters",
             ),
             "</section>",
+            html_run_detail_section(runs),
             '<section class="panel"><h2>Validation</h2>',
             html_table(
                 ["Kind", "Attempts", "Failures", "Retries", "Final passes", "Final failures"],
