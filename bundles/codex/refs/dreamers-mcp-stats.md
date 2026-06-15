@@ -5,7 +5,7 @@ Use this ref only when the active Codex skill name starts with `dreamers-`.
 <dreamers-mcp-skill-bookends>
 Dreamers stats are best-effort only.
 
-If this ref file is missing, unreadable, the installed stats shim is missing, Python is unavailable, or any stats command fails, continue the Dreamers workflow normally. Do not retry in a loop. Make at most one best-effort attempt per checkpoint.
+If this ref file is missing, unreadable, the Dreamers stats MCP tool is unavailable, or any stats tool call fails, continue the Dreamers workflow normally. Do not retry in a loop. Make at most one best-effort attempt per checkpoint.
 
 Never include prompts, responses, tool outputs, diffs, transcript text, secrets, credentials, auth tokens, or PII in checkpoint metrics.
 
@@ -31,11 +31,16 @@ When running any `dreamers-*` skill:
 6. If the Dreamers skill finishes normally, record `skill_completed` once.
    - When known, prefer `final_status` values such as `completed`, `resolved`, or `approved`
 
-Use the installed Codex stats shim at `$CODEX_HOME/dreamers/scripts/dreamers_stats.py` when `CODEX_HOME` is set, otherwise `~/.codex/dreamers/scripts/dreamers_stats.py`.
+Use the Dreamers stats MCP tool `mcp__dreamers_stats.record_checkpoint` for every checkpoint. Do not run a Python stats shim for Dreamers skill bookends.
 
-Use the Python command that actually exists in the current environment. Prefer `python3` on Linux or macOS, `python` when that is the installed command, and `py -3` on Windows when that is the available launcher.
+Tool call shape:
 
-Checkpoint command shape:
-
-`<python-command> "<stats-shim>" checkpoint --client codex --home "<codex-home>" --event-type <event-type> --skill "<dreamers-skill-name>" --run-id "<run-id>" --metrics-json '<json-object>'`
+- `client`: `codex`
+- `home`: the active Codex home, usually `$CODEX_HOME` or `~/.codex`
+- `event_type`: checkpoint event type such as `skill_started`, `validation_attempt`, `gate_decided`, `skill_halted`, or `skill_completed`
+- `skill`: active Dreamers skill name
+- `run_id`: compact run id reused for the skill invocation
+- `repo_path`: current repository path when known
+- `branch`: current git branch when known
+- `metrics`: compact schema-safe metrics for that checkpoint
 </dreamers-mcp-skill-bookends>
