@@ -224,7 +224,7 @@ class CodexBundleTests(BundleTestCase):
         self.assertEqual("# user-modified\n", stats_ref.read_text(encoding="utf-8"))
         self.assertFalse((self.codex_home / CODEX_AGENTS_CONFIG_RELATIVE).exists())
 
-    def test_installed_wrapper_records_safe_codex_events_and_mcp_server_reports_unavailable_tokens(self):
+    def test_installed_wrapper_records_safe_codex_events_and_mcp_server_reports_exact_tokens(self):
         self.codex_home.mkdir(parents=True, exist_ok=True)
         installed = self.run_shell_script(
             CODEX_BASH_INSTALLER_PATH,
@@ -253,6 +253,42 @@ class CodexBundleTests(BundleTestCase):
         )
         self.assertEqual(0, prompt_event.returncode, prompt_event.stderr)
 
+        session_path = (
+            self.codex_home
+            / "sessions"
+            / "2026"
+            / "06"
+            / "15"
+            / "rollout-2026-06-15T00-00-00-session_bundle.jsonl"
+        )
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "event_msg", "payload": {"type": "user_prompt", "text": "secret prompt text"}}),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "last_token_usage": {
+                                        "input_tokens": 300,
+                                        "cached_input_tokens": 250,
+                                        "output_tokens": 40,
+                                        "total_tokens": 340,
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "event_msg", "payload": {"type": "assistant_message", "text": "secret assistant text"}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         stop_event = self.run_shell_script(
             self.codex_home / CODEX_BASH_WRAPPER_RELATIVE,
             "Stop",
@@ -261,6 +297,7 @@ class CodexBundleTests(BundleTestCase):
                     "cwd": str(self.fixture_repo),
                     "timestamp": 1_718_302_520_000,
                     "turn_id": "turn_01",
+                    "session_id": "session_bundle",
                     "last_assistant_message": "secret assistant text",
                     "stop_hook_active": False,
                 }
@@ -322,8 +359,10 @@ class CodexBundleTests(BundleTestCase):
         responses = [json.loads(line) for line in server.stdout.splitlines() if line.strip()]
         tokens_response = responses[-1]["result"]["structuredContent"]
         self.assertEqual("tokens", tokens_response["report_type"])
-        self.assertEqual(0, tokens_response["exact"]["row_count"])
-        self.assertEqual(1, tokens_response["unavailable"]["row_count"])
+        self.assertEqual(1, tokens_response["exact"]["row_count"])
+        self.assertEqual(0, tokens_response["unavailable"]["row_count"])
+        self.assertEqual(340, tokens_response["exact"]["totals"]["total_tokens"])
+        self.assertEqual(250, tokens_response["exact"]["totals"]["cache_read_tokens"])
 
     def test_install_skips_config_when_required_same_path_asset_is_user_owned(self):
         scripts_dir = self.codex_home / "dreamers" / "scripts"
