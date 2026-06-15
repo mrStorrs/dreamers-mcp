@@ -169,6 +169,15 @@ class SharedStatsTests(unittest.TestCase):
                 handle.write("\n")
         return session_path
 
+    def write_copilot_session_lines(self, session_id, lines, *, home=None):
+        session_path = (home or self.copilot_home) / "session-state" / session_id / "events.jsonl"
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        with session_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for line in lines:
+                handle.write(json.dumps(line))
+                handle.write("\n")
+        return session_path
+
     def write_review_artifact(self, repo_path, name, body):
         artifact_path = repo_path / ".dreamers" / "reviews" / name
         artifact_path.write_text(body, encoding="utf-8")
@@ -269,6 +278,148 @@ class SharedStatsTests(unittest.TestCase):
         self.assertNotIn("secret.txt", raw_line)
         self.assertNotIn("do not store", raw_line)
         self.assertNotIn("Bearer abc1234567890", raw_line)
+
+    def test_copilot_session_end_records_exact_tokens_from_session_log(self):
+        self.write_copilot_session_lines(
+            "session_exact",
+            [
+                {
+                    "timestamp": "2026-06-15T00:00:01Z",
+                    "type": "assistant.message",
+                    "data": {"message": "secret assistant text", "outputTokens": 50},
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:02Z",
+                    "type": "session.shutdown",
+                    "data": {
+                        "modelMetrics": {
+                            "gpt-5.4": {
+                                "usage": {
+                                    "inputTokens": 300,
+                                    "outputTokens": 40,
+                                    "cacheReadTokens": 250,
+                                    "cacheWriteTokens": 0,
+                                }
+                            }
+                        }
+                    },
+                },
+            ],
+        )
+
+        code, stdout, stderr = self.invoke_hook(
+            "sessionEnd",
+            {
+                "cwd": str(self.fixture_repo),
+                "timestamp": "2026-06-15T00:00:03Z",
+                "sessionId": "session_exact",
+                "reason": "shutdown",
+                "transcript": "do not store transcript",
+            },
+            "--client",
+            "copilot",
+            "--home",
+            str(self.copilot_home),
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+        stored = self.read_events(self.copilot_events)
+        token_events = [event for event in stored if event["event_type"] == "token_usage_recorded"]
+        self.assertEqual(1, len(token_events))
+        token_metrics = token_events[0]["metrics"]
+        self.assertEqual("exact", token_metrics["token_source"])
+        self.assertEqual("session", token_metrics["attribution_scope"])
+        self.assertEqual("gpt-5.4", token_metrics["model"])
+        self.assertEqual(300, token_metrics["input_tokens"])
+        self.assertEqual(40, token_metrics["output_tokens"])
+        self.assertEqual(340, token_metrics["total_tokens"])
+        self.assertEqual(250, token_metrics["cache_read_tokens"])
+        self.assertEqual(0, token_metrics["cache_write_tokens"])
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(1, report["exact"]["row_count"])
+        self.assertEqual(0, report["unavailable"]["row_count"])
+        self.assertEqual(340, report["exact"]["totals"]["total_tokens"])
+        self.assertEqual(250, report["exact"]["totals"]["cache_read_tokens"])
+        self.assertEqual(340, report["exact"]["models"]["gpt-5.4"]["total_tokens"])
+
+        raw_line = self.copilot_events.read_text(encoding="utf-8")
+        self.assertNotIn("secret assistant text", raw_line)
+        self.assertNotIn("do not store transcript", raw_line)
+
+    def test_copilot_reports_resolve_unavailable_tokens_from_session_log(self):
+        self.write_copilot_session_lines(
+            "session_report",
+            [
+                {
+                    "timestamp": "2026-06-15T00:00:04Z",
+                    "type": "session.shutdown",
+                    "data": {
+                        "modelMetrics": {
+                            "claude-opus-4.6": {
+                                "usage": {
+                                    "inputTokens": 80,
+                                    "outputTokens": 20,
+                                    "cacheReadTokens": 40,
+                                    "cacheWriteTokens": 0,
+                                }
+                            }
+                        }
+                    },
+                },
+                {
+                    "timestamp": "2026-06-15T00:00:10Z",
+                    "type": "session.shutdown",
+                    "data": {
+                        "modelMetrics": {
+                            "claude-opus-4.6": {
+                                "usage": {
+                                    "inputTokens": 900,
+                                    "outputTokens": 99,
+                                    "cacheReadTokens": 800,
+                                    "cacheWriteTokens": 0,
+                                }
+                            }
+                        }
+                    },
+                },
+            ],
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_report_copilot_unavailable_tokens",
+                timestamp="2026-06-15T00:00:05Z",
+                session_id="session_report",
+                source="summary",
+                metrics={"token_source": "unavailable", "attribution_scope": "session"},
+            ),
+            client="copilot",
+            home=self.copilot_home,
+        )
+
+        code, stdout, stderr = self.invoke(
+            ["tokens", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "all", "--json"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(1, report["exact"]["row_count"])
+        self.assertEqual(0, report["unavailable"]["row_count"])
+        self.assertEqual(100, report["exact"]["totals"]["total_tokens"])
+        self.assertEqual(40, report["exact"]["totals"]["cache_read_tokens"])
+        raw_line = self.copilot_events.read_text(encoding="utf-8")
+        self.assertIn('"token_source":"unavailable"', raw_line)
 
     def test_codex_hook_events_map_to_shared_schema_and_report_unavailable_tokens(self):
         cases = [

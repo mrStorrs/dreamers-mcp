@@ -90,7 +90,7 @@ python3 -m dreamers_stats hook --client codex --home /tmp/codex-home --event-nam
 
 The `dashboard` command renders a standalone HTML file from the existing bounded reports. Omit `--output` to print the HTML document to stdout. Use `--repo all` for a first smoke test, or run `--repo current` from the repository whose stats you want to inspect.
 
-For Codex, `Stop` hooks record exact token totals when a matching local session JSONL contains token-count data; reports also resolve older unavailable token rows from local session logs when possible. Stats keep the unavailable fallback when exact data is missing, and the dashboard token card shows `n/a` or unavailable rather than `0` in that case.
+For Codex, `Stop` hooks record exact token totals when a matching local session JSONL contains token-count data. For Copilot, `sessionEnd` hooks record exact session totals when `.copilot/session-state/<session_id>/events.jsonl` contains `session.shutdown` model metrics. Reports also resolve older unavailable token rows from local session logs when possible. Stats keep the unavailable fallback when exact data is missing, and the dashboard token card shows `n/a` or unavailable rather than `0` in that case.
 
 Compatibility aliases remain available for current Copilot callers:
 
