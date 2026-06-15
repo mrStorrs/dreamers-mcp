@@ -1821,6 +1821,7 @@ def report_filters_public(filters: dict[str, Any]) -> dict[str, Any]:
         "skill": filters["skill"],
         "since": filters["since"],
         "until": filters["until"],
+        "current_repo": filters["current_repo"],
     }
 
 
@@ -1997,10 +1998,12 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
         for name, value in {
             "client": client,
             "repo": filters.get("repo"),
+            "current_repo": filters.get("current_repo"),
             "skill": filters.get("skill") or "all",
             "since": filters.get("since") or "beginning",
             "until": filters.get("until") or "now",
         }.items()
+        if value is not None
     )
     run_rows = [
         [
@@ -2073,13 +2076,17 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             html_metric_card("Tokens", tokens["exact"]["totals"]["total_tokens"], "exact total"),
             "</section>",
             '<section class="panel"><h2>Runs by skill</h2>',
-            html_table(["Skill", "Status", "Runs", "Avg duration", "Last seen"], run_rows, "no runs"),
+            html_table(
+                ["Skill", "Status", "Runs", "Avg duration", "Last seen"],
+                run_rows,
+                "no runs matched these filters",
+            ),
             "</section>",
             '<section class="panel"><h2>Validation</h2>',
             html_table(
                 ["Kind", "Attempts", "Failures", "Retries", "Final passes", "Final failures"],
                 validation_rows,
-                "no validation attempts",
+                "no validation attempts matched these filters",
             ),
             "</section>",
             '<section class="grid">',
@@ -2111,6 +2118,8 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
 
 def format_filter_header(filters: dict[str, Any]) -> str:
     parts = [f"repo={filters['repo']}"]
+    if filters.get("current_repo"):
+        parts.append(f"current_repo={filters['current_repo']}")
     if filters.get("skill"):
         parts.append(f"skill={filters['skill']}")
     if filters.get("since"):
@@ -2192,6 +2201,25 @@ def run_report_command(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
     if args.json:
         return report, json.dumps(report, sort_keys=True)
     return report, REPORT_FORMATTERS[args.command](report)
+
+
+def build_dashboard_output(args: argparse.Namespace) -> str:
+    context = resolve_args_context(args)
+    report = run_report(
+        "summarize",
+        client=context.client,
+        home=context.home,
+        repo=args.repo,
+        skill=args.skill,
+        since=args.since,
+        until=args.until,
+        cwd=Path.cwd(),
+    )
+    return render_dashboard_html(
+        report,
+        client=context.client,
+        generated_at=getattr(args, "generated_at", None),
+    )
 
 
 def load_event(args: argparse.Namespace, stdin: TextIO) -> dict[str, Any]:
@@ -2280,6 +2308,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser = subcommands.add_parser("dashboard")
     add_report_filter_arguments(dashboard_parser)
     dashboard_parser.add_argument("--output")
+    dashboard_parser.add_argument("--generated-at", help=argparse.SUPPRESS)
 
     return parser
 
@@ -2387,18 +2416,7 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
 
     if args.command == "dashboard":
         try:
-            context = resolve_args_context(args)
-            report = run_report(
-                "summarize",
-                client=context.client,
-                home=context.home,
-                repo=args.repo,
-                skill=args.skill,
-                since=args.since,
-                until=args.until,
-                cwd=Path.cwd(),
-            )
-            output = render_dashboard_html(report, client=context.client)
+            output = build_dashboard_output(args)
         except StatsValidationError as exc:
             print(exc.category, file=sys.stderr)
             return 2
@@ -2414,7 +2432,7 @@ def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
                 print("write_failed", file=sys.stderr)
                 return 1
         else:
-            print(output)
+            sys.stdout.write(output)
         return 0
 
     parser.error("unknown command")

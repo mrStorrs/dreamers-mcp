@@ -666,6 +666,8 @@ class SharedStatsTests(unittest.TestCase):
                 str(self.codex_home),
                 "--repo",
                 "current",
+                "--generated-at",
+                "2026-06-15T00:00:00Z",
                 "--output",
                 str(output_path),
             ],
@@ -675,15 +677,36 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("", stdout)
         self.assertEqual("", stderr)
+        self.assertGreater(output_path.stat().st_size, 1000)
         html_text = output_path.read_text(encoding="utf-8")
         self.assertIn("<!doctype html>", html_text)
         self.assertIn("Dreamers Stats", html_text)
+        self.assertIn(f"current_repo={self.fixture_repo}", html_text)
         self.assertIn("Runs by skill", html_text)
         self.assertIn("Reviews", html_text)
         self.assertIn("Validation", html_text)
         self.assertIn("Gates", html_text)
         self.assertIn("Tokens", html_text)
         self.assertIn("dreamers-full", html_text)
+
+        code, stdout, stderr = self.invoke(
+            [
+                "dashboard",
+                "--client",
+                "codex",
+                "--home",
+                str(self.codex_home),
+                "--repo",
+                "current",
+                "--generated-at",
+                "2026-06-15T00:00:00Z",
+            ],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertEqual(html_text, stdout)
 
     def test_dashboard_command_writes_html_to_stdout_without_output_path(self):
         self.record_fixture_event(
@@ -706,6 +729,18 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual("", stderr)
         self.assertIn("<!doctype html>", stdout)
         self.assertIn("dreamers-lite", stdout)
+
+    def test_dashboard_empty_state_names_active_filter(self):
+        code, stdout, stderr = self.invoke(
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn(f"current_repo={self.fixture_repo}", stdout)
+        self.assertIn("no runs matched these filters", stdout)
+        self.assertIn("no validation attempts matched these filters", stdout)
 
     def test_dashboard_renderer_escapes_report_values(self):
         self.record_fixture_event(
