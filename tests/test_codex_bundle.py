@@ -143,7 +143,11 @@ class CodexBundleTests(BundleTestCase):
         self.assertIn("skill_completed", ref_text)
         self.assertIn("skill_halted", ref_text)
         self.assertIn("approved_start_implementation", ref_text)
-        self.assertIn("py -3", ref_text)
+        self.assertIn("mcp__dreamers_stats.record_checkpoint", ref_text)
+        self.assertIn("record_checkpoint", ref_text)
+        self.assertNotIn("dreamers_stats.py", ref_text)
+        self.assertNotIn("checkpoint --client", ref_text)
+        self.assertNotIn("py -3", ref_text)
 
         removed = self.run_shell_script(
             CODEX_BASH_REMOVER_PATH,
