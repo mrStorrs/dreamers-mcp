@@ -1031,6 +1031,8 @@ def default_status_for_event(event_type: str) -> str:
 
 def hook_timestamp(payload: dict[str, Any]) -> str:
     value = hook_value(payload, "timestamp")
+    if value in (None, ""):
+        return utc_now_iso()
     if isinstance(value, int | float):
         return datetime.fromtimestamp(value / 1000, tz=UTC).replace(microsecond=0).isoformat().replace(
             "+00:00",
