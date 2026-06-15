@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 
+from dreamers_stats import codex_bundle
 from tests.bundle_test_support import (
     CODEX_AGENTS_CONFIG_RELATIVE,
     CODEX_BASH_INSTALLER_PATH,
@@ -23,6 +24,49 @@ from tests.bundle_test_support import (
 
 
 class CodexBundleTests(BundleTestCase):
+    def test_install_updates_previously_managed_runtime_file_when_source_changes(self):
+        checkout_root = self.fixture_repo / "checkout"
+        runtime_dir = checkout_root / "dreamers_stats"
+        scripts_dir = checkout_root / "bundles" / "codex" / "scripts"
+        refs_dir = checkout_root / "bundles" / "codex" / "refs"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        refs_dir.mkdir(parents=True, exist_ok=True)
+
+        for name in codex_bundle.RUNTIME_FILES:
+            shutil.copy2(REPO_ROOT / "dreamers_stats" / name, runtime_dir / name)
+        for source_dir, target_dir in (
+            (REPO_ROOT / "bundles" / "codex" / "scripts", scripts_dir),
+            (REPO_ROOT / "bundles" / "codex" / "refs", refs_dir),
+        ):
+            for source_path in source_dir.iterdir():
+                if source_path.is_file():
+                    shutil.copy2(source_path, target_dir / source_path.name)
+
+        first = codex_bundle.install_bundle(
+            self.codex_home,
+            checkout_root,
+            force=False,
+            launcher_command="python3",
+            launcher_args=[],
+        )
+        self.assertGreater(first.installed_count, 0)
+
+        source_runtime = runtime_dir / "runtime.py"
+        source_runtime.write_text(source_runtime.read_text(encoding="utf-8") + "\n# updated source\n", encoding="utf-8")
+
+        second = codex_bundle.install_bundle(
+            self.codex_home,
+            checkout_root,
+            force=False,
+            launcher_command="python3",
+            launcher_args=[],
+        )
+
+        installed_runtime = self.codex_home / INSTALLED_RUNTIME_PACKAGE_RELATIVE / "runtime.py"
+        self.assertEqual(1, second.installed_count)
+        self.assertEqual(source_runtime.read_text(encoding="utf-8"), installed_runtime.read_text(encoding="utf-8"))
+
     def test_bash_install_and_remove_preserve_history_and_user_config(self):
         historic_events = self.events_file(self.codex_home)
         historic_events.parent.mkdir(parents=True, exist_ok=True)

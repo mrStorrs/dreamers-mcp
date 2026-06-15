@@ -377,6 +377,75 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(0, report["exact"]["row_count"])
         self.assertEqual(1, report["unavailable"]["row_count"])
 
+    def test_codex_hook_events_accept_docs_shaped_payloads_without_timestamp(self):
+        before = datetime.now(tz=UTC)
+        cases = [
+            (
+                "SessionStart",
+                {
+                    "cwd": "/tmp/example",
+                    "source": "startup",
+                    "session_id": "session_docs",
+                },
+                "session_started",
+            ),
+            (
+                "UserPromptSubmit",
+                {
+                    "cwd": "/tmp/example",
+                    "prompt": "do not store prompt text",
+                    "turn_id": "turn_docs",
+                    "session_id": "session_docs",
+                },
+                "prompt_submitted",
+            ),
+            (
+                "Stop",
+                {
+                    "cwd": "/tmp/example",
+                    "stop_hook_active": False,
+                    "last_assistant_message": "do not store assistant text",
+                    "turn_id": "turn_docs",
+                    "session_id": "session_docs",
+                },
+                "turn_completed",
+            ),
+        ]
+
+        for event_name, payload, event_type in cases:
+            with self.subTest(event_name=event_name):
+                code, stdout, stderr = self.invoke_hook(
+                    event_name,
+                    payload,
+                    "--client",
+                    "codex",
+                    "--home",
+                    str(self.codex_home),
+                )
+                self.assertEqual(0, code)
+                self.assertEqual("", stdout)
+                self.assertEqual("", stderr)
+
+        after = datetime.now(tz=UTC)
+        stored = self.read_events(self.codex_events)
+        for event in stored:
+            parsed = runtime.parse_iso_timestamp(event["timestamp"]).astimezone(UTC)
+            self.assertGreaterEqual(parsed, before.replace(microsecond=0))
+            self.assertLessEqual(parsed, after.replace(microsecond=0))
+
+        stored_types = [event["event_type"] for event in stored]
+        self.assertEqual(
+            [
+                "session_started",
+                "prompt_submitted",
+                "turn_completed",
+                "token_usage_recorded",
+            ],
+            stored_types,
+        )
+        raw_line = self.codex_events.read_text(encoding="utf-8")
+        self.assertNotIn("do not store", raw_line)
+
     def test_checkpoint_validation_blocks_freeform_metrics(self):
         code, stdout, stderr = self.invoke_checkpoint(
             "gate_decided",

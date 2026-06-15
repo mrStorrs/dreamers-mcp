@@ -152,7 +152,9 @@ def copy_bundle_files(
                 managed_files[relative_key] = source_hash
                 continue
             if previous_files.get(relative_key) == target_hash:
-                managed_files[relative_key] = target_hash
+                shutil.copy2(source_path, target_path)
+                managed_files[relative_key] = source_hash
+                copied += 1
                 continue
             continue
         shutil.copy2(source_path, target_path)
