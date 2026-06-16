@@ -859,6 +859,16 @@ class SharedStatsTests(unittest.TestCase):
         )
         self.record_fixture_event(
             self.fixture_event(
+                "skill_started",
+                event_id="evt_run_lite_start",
+                timestamp="2026-06-13T11:00:00Z",
+                run_id="run_lite_01",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            )
+        )
+        self.record_fixture_event(
+            self.fixture_event(
                 "skill_halted",
                 event_id="evt_run_lite_end",
                 timestamp="2026-06-13T11:05:00Z",
@@ -1113,8 +1123,12 @@ class SharedStatsTests(unittest.TestCase):
             cwd=self.fixture_repo,
         )
 
-        self.assertEqual(2, report["run_count"])
+        self.assertEqual(1, report["run_count"])
+        self.assertEqual(1, report["incomplete_count"])
         items = {item["run_id"]: item for item in report["items"]}
+        self.assertNotIn("run_detail_02", items)
+        incomplete = {item["run_id"]: item for item in report["incomplete_items"]}
+        self.assertEqual("missing_terminal", incomplete["run_detail_02"]["reason"])
         run = items["run_detail_01"]
         self.assertEqual("completed", run["status"])
         self.assertEqual(360, run["duration_seconds"])
@@ -1126,6 +1140,156 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(1, run["reviews"]["review_count"])
         self.assertEqual(1, run["reviews"]["findings_by_severity"]["high"])
         self.assertEqual(42, run["tokens"]["exact"]["totals"]["total_tokens"])
+
+    def test_runs_report_separates_unreliable_runs_from_default_aggregates(self):
+        events = [
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_reliable_start",
+                timestamp="2026-06-13T10:00:00Z",
+                run_id="run_reliable",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_reliable_done",
+                timestamp="2026-06-13T10:03:00Z",
+                run_id="run_reliable",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "validation_attempt",
+                event_id="evt_missing_start_validation",
+                timestamp="2026-06-13T10:04:00Z",
+                run_id="run_missing_start",
+                skill="dreamers-lite",
+                metrics={
+                    "command_kind": "test",
+                    "command_label": "unittest",
+                    "attempt_number": 1,
+                    "result": "fail",
+                    "failure_category": "test-failure",
+                },
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_missing_terminal_start",
+                timestamp="2026-06-13T10:05:00Z",
+                run_id="run_missing_terminal",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_missing_terminal_tokens",
+                timestamp="2026-06-13T10:06:00Z",
+                run_id="run_missing_terminal",
+                session_id="sess_missing_terminal",
+                skill="dreamers-lite",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "attribution_scope": "session",
+                    "input_tokens": 90,
+                    "output_tokens": 10,
+                    "total_tokens": 100,
+                },
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_duplicate_start_a",
+                timestamp="2026-06-13T10:07:00Z",
+                run_id="run_duplicate_start",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_duplicate_start_b",
+                timestamp="2026-06-13T10:08:00Z",
+                run_id="run_duplicate_start",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_duplicate_start_done",
+                timestamp="2026-06-13T10:09:00Z",
+                run_id="run_duplicate_start",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_duplicate_terminal_start",
+                timestamp="2026-06-13T10:10:00Z",
+                run_id="run_duplicate_terminal",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_duplicate_terminal_done_a",
+                timestamp="2026-06-13T10:11:00Z",
+                run_id="run_duplicate_terminal",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_halted",
+                event_id="evt_duplicate_terminal_done_b",
+                timestamp="2026-06-13T10:12:00Z",
+                run_id="run_duplicate_terminal",
+                skill="dreamers-lite",
+                metrics={"halt_reason_category": "other_safe"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_reversed_done",
+                timestamp="2026-06-13T10:13:00Z",
+                run_id="run_reversed",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_reversed_start",
+                timestamp="2026-06-13T10:14:00Z",
+                run_id="run_reversed",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event)
+
+        report = runtime.run_report(
+            "runs",
+            client="copilot",
+            home=self.copilot_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(1, report["run_count"])
+        self.assertEqual(5, report["incomplete_count"])
+        self.assertEqual(["run_reliable"], [item["run_id"] for item in report["items"]])
+        reliable = report["items"][0]
+        self.assertEqual(0, reliable["validation"]["attempt_count"])
+        self.assertEqual(0, reliable["tokens"]["exact"]["totals"]["total_tokens"])
+        reasons = {item["run_id"]: item["reason"] for item in report["incomplete_items"]}
+        self.assertEqual(
+            {
+                "run_missing_start": "missing_start",
+                "run_missing_terminal": "missing_terminal",
+                "run_duplicate_start": "duplicate_starts",
+                "run_duplicate_terminal": "duplicate_terminals",
+                "run_reversed": "terminal_before_start",
+            },
+            reasons,
+        )
 
     def test_runs_report_correlates_hook_token_events_by_unique_session(self):
         session_id = "session_run_detail_hook"
@@ -1209,6 +1373,91 @@ class SharedStatsTests(unittest.TestCase):
 
         items = {item["run_id"]: item for item in report["items"]}
         self.assertEqual(100, items["run_detail_hook_01"]["tokens"]["exact"]["totals"]["total_tokens"])
+
+    def test_runs_report_keeps_shared_session_tokens_unattributed_when_incomplete_run_competes(self):
+        session_id = "session_shared_with_incomplete"
+        self.write_codex_session_lines(
+            session_id,
+            [
+                {
+                    "timestamp": "2026-06-15T10:06:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100,
+                                "output_tokens": 50,
+                                "total_tokens": 150,
+                            },
+                            "model": "gpt-5",
+                        },
+                    },
+                },
+            ],
+        )
+        events = [
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_shared_reliable_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_shared_reliable",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_shared_reliable_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_shared_reliable",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_shared_incomplete_start",
+                timestamp="2026-06-15T10:02:00Z",
+                run_id="run_shared_incomplete",
+                session_id=session_id,
+                skill="dreamers-full",
+                metrics={"mode": "task-description"},
+            ),
+        ]
+        for event in events:
+            self.record_fixture_event(event, client="codex", home=self.codex_home)
+
+        code, stdout, stderr = self.invoke_hook(
+            "Stop",
+            {
+                "cwd": str(self.fixture_repo),
+                "timestamp": "2026-06-15T10:06:00Z",
+                "session_id": session_id,
+                "stop_hook_active": False,
+            },
+            "--client",
+            "codex",
+            "--home",
+            str(self.codex_home),
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("", stderr)
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(1, report["run_count"])
+        self.assertEqual(1, report["incomplete_count"])
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertEqual(0, items["run_shared_reliable"]["tokens"]["exact"]["totals"]["total_tokens"])
+        self.assertEqual("run_shared_incomplete", report["incomplete_items"][0]["run_id"])
 
     def test_dashboard_command_writes_standalone_html_file(self):
         self.record_fixture_event(
@@ -1464,7 +1713,8 @@ class SharedStatsTests(unittest.TestCase):
         self.assertIn("<strong>1,234,567</strong>", html_text)
         self.assertIn('<span class="status-badge status-completed">completed</span>', html_text)
         self.assertIn('<span class="status-badge status-halted">halted</span>', html_text)
-        self.assertIn('<span class="status-badge status-in-progress">in_progress</span>', html_text)
+        self.assertIn("Incomplete / ambiguous runs", html_text)
+        self.assertIn("missing_terminal", html_text)
 
     def test_dashboard_cli_uses_structured_gate_and_token_tables(self):
         events = [
@@ -1757,6 +2007,62 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(1, report["artifact_summary"]["parsed_count"])
         self.assertEqual(1, report["artifact_summary"]["missing_count"])
 
+    def test_reviews_report_counts_unreferenced_current_repo_artifacts_once(self):
+        referenced_name = "vigil-referenced-20260613-101000.md"
+        unreferenced_name = "probe-unreferenced-20260613-101500.md"
+        other_repo_name = "hone-other-20260613-102000.md"
+        self.write_review_artifact(
+            self.fixture_repo,
+            referenced_name,
+            "Findings reported - 1 items\n\nFindings\n- [high] [simplicity] dreamers_stats/runtime.py:10 - issue -> fix\n\nOpen Questions\n- none\n",
+        )
+        self.write_review_artifact(
+            self.fixture_repo,
+            unreferenced_name,
+            "Blocked - missing coverage\n\nFindings\n- [medium] [test-coverage] tests/test_shared_stats.py:10 - issue -> fix\n\nOpen Questions\n1. should this rerun?\n",
+        )
+        (self.other_repo / ".dreamers" / "reviews").mkdir(parents=True)
+        self.write_review_artifact(
+            self.other_repo,
+            other_repo_name,
+            "Findings reported - 1 items\n\nFindings\n- [low] [simplicity] other.py:1 - issue -> fix\n\nOpen Questions\nnone\n",
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "review_pass_completed",
+                event_id="evt_review_referenced",
+                timestamp="2026-06-13T10:15:00Z",
+                run_id="run_review_referenced",
+                skill="dreamers-lite",
+                metrics={
+                    "review_pass_id": "review_referenced",
+                    "lane": "vigil",
+                    "reviewers": ["vigil"],
+                    "artifact_paths": [f".dreamers/reviews/{referenced_name}"],
+                    "findings_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                    "findings_by_lens": {"correctness": 0, "security": 0, "maintainability": 0, "test-coverage": 0, "simplicity": 0},
+                    "blocked": False,
+                    "open_question_count": 0,
+                },
+            )
+        )
+
+        code, stdout, stderr = self.invoke(
+            ["reviews", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current", "--json"],
+            cwd=self.fixture_repo,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        report = json.loads(stdout)
+        self.assertEqual(2, report["review_count"])
+        self.assertEqual(1, report["artifact_summary"]["artifact_only_count"])
+        self.assertEqual(2, report["artifact_summary"]["parsed_count"])
+        self.assertEqual(1, report["blocked_count"])
+        self.assertEqual(1, report["open_question_count"])
+        self.assertEqual(1, report["findings_by_severity"]["high"])
+        self.assertEqual(1, report["findings_by_severity"]["medium"])
+
     def test_validation_report_uses_full_attempt_identity_and_timestamp_tiebreaker(self):
         base_metrics = {
             "command_kind": "test",
@@ -1815,6 +2121,16 @@ class SharedStatsTests(unittest.TestCase):
         self.assertEqual(1, report["command_kinds"]["test"]["final_fail_count"])
 
     def test_mcp_server_lists_tools_and_returns_bounded_summary(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_summary_start",
+                timestamp="2026-06-13T09:55:00Z",
+                run_id="run_summary_01",
+                skill="dreamers-full",
+                metrics={"mode": "task-description"},
+            )
+        )
         self.record_fixture_event(
             self.fixture_event(
                 "skill_completed",
