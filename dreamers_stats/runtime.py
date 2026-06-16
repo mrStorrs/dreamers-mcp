@@ -194,6 +194,7 @@ CYCLE_STATUSES = {"completed", "halted", "blocked"}
 DOCS_STATUSES = {"updated", "skipped", "not-needed"}
 PUSH_STATUSES = {"pushed", "held", "not-requested"}
 FINAL_STATUSES = {"completed", "resolved", "approved"}
+TERMINAL_SKILL_EVENTS = {"skill_completed", "skill_halted"}
 FINDING_SEVERITIES = {"critical", "high", "medium", "low"}
 FINDING_LENSES = {
     "correctness",
@@ -1929,7 +1930,12 @@ def summarize_review_events(review_events: list[dict[str, Any]]) -> dict[str, An
         merge_count_dicts(findings_by_severity, count_source.get("findings_by_severity", {}), FINDING_SEVERITY_ORDER)
         merge_count_dicts(findings_by_lens, count_source.get("findings_by_lens", {}), FINDING_LENS_ORDER)
 
-        if event_artifacts and not event_missing and review_event_has_artifact_mismatch(metrics, artifact_aggregate):
+        if (
+            event_artifacts
+            and not event_missing
+            and not metrics.get("artifact_only")
+            and review_event_has_artifact_mismatch(metrics, artifact_aggregate)
+        ):
             mismatches.append(
                 {
                     "review_pass_id": metrics.get("review_pass_id"),
@@ -1952,6 +1958,7 @@ def summarize_review_events(review_events: list[dict[str, Any]]) -> dict[str, An
             "parsed_count": len(parsed_artifact_paths),
             "missing_count": len(missing_artifact_paths),
             "mismatch_count": len(mismatches),
+            "artifact_only_count": 0,
             "mismatches": mismatches,
         },
     }
@@ -1968,39 +1975,42 @@ def summarize_token_events(token_events: list[dict[str, Any]]) -> dict[str, Any]
 def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     runs: dict[tuple[str, str, str], dict[str, Any]] = {}
     events_by_run: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
-    run_keys_by_session: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
     for event in events:
         run_key = run_key_for_event(event)
         if run_key is None:
             continue
         run_id, repo_path, skill = run_key
         events_by_run[run_key].append(event)
-        session_id = event.get("session_id")
-        if isinstance(session_id, str) and session_id:
-            run_keys_by_session[(repo_path, session_id)].add(run_key)
         run = runs.setdefault(
             run_key,
             {
                 "run_id": run_id,
                 "repo_path": repo_path,
                 "skill": skill,
-                "status": "in_progress",
                 "first_timestamp": event["_parsed_timestamp"],
                 "last_timestamp": event["_parsed_timestamp"],
-                "start_timestamp": None,
-                "end_timestamp": None,
+                "start_events": [],
+                "terminal_events": [],
             },
         )
         run["first_timestamp"] = min(run["first_timestamp"], event["_parsed_timestamp"])
         run["last_timestamp"] = max(run["last_timestamp"], event["_parsed_timestamp"])
         if event["event_type"] == "skill_started":
-            run["start_timestamp"] = event["_parsed_timestamp"]
-        elif event["event_type"] == "skill_completed":
-            run["end_timestamp"] = event["_parsed_timestamp"]
-            run["status"] = event["metrics"].get("final_status") or event.get("status") or "completed"
-        elif event["event_type"] == "skill_halted":
-            run["end_timestamp"] = event["_parsed_timestamp"]
-            run["status"] = event.get("status") or "halted"
+            run["start_events"].append(event)
+        elif event["event_type"] in TERMINAL_SKILL_EVENTS:
+            run["terminal_events"].append(event)
+
+    reliable_keys = {
+        run_key
+        for run_key, run in runs.items()
+        if run_reliability_reason(run) is None
+    }
+    run_keys_by_session: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
+    for run_key in runs:
+        for event in events_by_run[run_key]:
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                run_keys_by_session[(event["repo_path"], session_id)].add(run_key)
 
     for event in events:
         if event["event_type"] != "token_usage_recorded" or run_key_for_event(event) is not None:
@@ -2010,20 +2020,95 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
             continue
         candidate_keys = run_keys_by_session.get((event["repo_path"], session_id), set())
         if len(candidate_keys) == 1:
-            events_by_run[next(iter(candidate_keys))].append(event)
+            candidate_key = next(iter(candidate_keys))
+            if candidate_key in reliable_keys:
+                events_by_run[candidate_key].append(event)
 
+    reliable_runs = {run_key: runs[run_key] for run_key in reliable_keys}
+    groups = build_reliable_run_groups(reliable_runs)
+    group_rows = run_group_rows(groups)
+    run_items = [
+        build_reliable_run_item(run, events_by_run[run_key])
+        for run_key, run in reliable_runs.items()
+    ]
+    run_items.sort(key=lambda item: (item["last_timestamp"] or "", item["run_id"]), reverse=True)
+
+    incomplete_items = [
+        build_incomplete_run_item(run, reason)
+        for run in runs.values()
+        if (reason := run_reliability_reason(run)) is not None
+    ]
+    incomplete_items.sort(key=lambda item: (item["last_timestamp"] or "", item["run_id"]), reverse=True)
+
+    return {
+        "report_type": "runs",
+        "warning_count": warning_count,
+        "filters": report_filters_public(filters),
+        "run_count": len(run_items),
+        "incomplete_count": len(incomplete_items),
+        "range": run_range(reliable_runs.values()),
+        "groups": group_rows,
+        "items": run_items,
+        "incomplete_items": incomplete_items,
+    }
+
+
+def run_reliability_reason(run: dict[str, Any]) -> str | None:
+    start_events = run["start_events"]
+    terminal_events = run["terminal_events"]
+    if not start_events:
+        return "missing_start"
+    if len(start_events) > 1:
+        return "duplicate_starts"
+    if not terminal_events:
+        return "missing_terminal"
+    if len(terminal_events) > 1:
+        return "duplicate_terminals"
+    if terminal_events[0]["_parsed_timestamp"] < start_events[0]["_parsed_timestamp"]:
+        return "terminal_before_start"
+    return None
+
+
+def run_start_timestamp(run: dict[str, Any]) -> datetime | None:
+    if not run["start_events"]:
+        return None
+    return run["start_events"][0]["_parsed_timestamp"]
+
+
+def run_end_timestamp(run: dict[str, Any]) -> datetime | None:
+    if not run["terminal_events"]:
+        return None
+    return run["terminal_events"][0]["_parsed_timestamp"]
+
+
+def run_status_from_terminal(run: dict[str, Any]) -> str:
+    terminal_event = run["terminal_events"][0]
+    if terminal_event["event_type"] == "skill_completed":
+        return terminal_event["metrics"].get("final_status") or terminal_event.get("status") or "completed"
+    return terminal_event.get("status") or "halted"
+
+
+def run_duration_seconds(start_timestamp: datetime | None, end_timestamp: datetime | None) -> int:
+    if start_timestamp is None or end_timestamp is None:
+        return 0
+    return max(int((end_timestamp - start_timestamp).total_seconds()), 0)
+
+
+def build_reliable_run_groups(runs: dict[tuple[str, str, str], dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for run in runs.values():
-        start_timestamp = run["start_timestamp"] or run["first_timestamp"]
-        end_timestamp = run["end_timestamp"] or run["last_timestamp"]
-        duration_seconds = int((end_timestamp - start_timestamp).total_seconds())
-        duration_seconds = max(duration_seconds, 0)
-        key = (run["skill"], run["status"])
+        start_timestamp = run_start_timestamp(run)
+        end_timestamp = run_end_timestamp(run)
+        if start_timestamp is None or end_timestamp is None:
+            continue
+        duration_seconds = run_duration_seconds(start_timestamp, end_timestamp)
+        status = run_status_from_terminal(run)
+        key = (run["skill"], status)
         group = groups.setdefault(
             key,
             {
                 "skill": run["skill"],
-                "status": run["status"],
+                "status": status,
                 "run_count": 0,
                 "total_duration_seconds": 0,
                 "first_timestamp": start_timestamp,
@@ -2034,14 +2119,17 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
         group["total_duration_seconds"] += duration_seconds
         group["first_timestamp"] = min(group["first_timestamp"], start_timestamp)
         group["last_timestamp"] = max(group["last_timestamp"], end_timestamp)
+    return groups
 
-    group_rows = []
+
+def run_group_rows(groups: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
     for key in sorted(groups):
         group = groups[key]
         average_duration = 0
         if group["run_count"]:
             average_duration = int(group["total_duration_seconds"] / group["run_count"])
-        group_rows.append(
+        rows.append(
             {
                 "skill": group["skill"],
                 "status": group["status"],
@@ -2052,55 +2140,63 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
                 "last_timestamp": datetime_to_iso(group["last_timestamp"]),
             }
         )
+    return rows
 
-    run_items = []
-    for run_key, run in runs.items():
-        start_timestamp = run["start_timestamp"] or run["first_timestamp"]
-        end_timestamp = run["end_timestamp"] or run["last_timestamp"]
-        duration_seconds = int((end_timestamp - start_timestamp).total_seconds())
-        duration_seconds = max(duration_seconds, 0)
-        run_events = events_by_run[run_key]
-        run_items.append(
-            {
-                "run_id": run["run_id"],
-                "repo_path": run["repo_path"],
-                "skill": run["skill"],
-                "status": run["status"],
-                "duration_seconds": duration_seconds,
-                "first_timestamp": datetime_to_iso(run["first_timestamp"]),
-                "last_timestamp": datetime_to_iso(run["last_timestamp"]),
-                "start_timestamp": datetime_to_iso(run["start_timestamp"]),
-                "end_timestamp": datetime_to_iso(run["end_timestamp"]),
-                "validation": summarize_validation_events(
-                    [event for event in run_events if event["event_type"] == "validation_attempt"]
-                ),
-                "gates": summarize_gate_events(
-                    [event for event in run_events if event["event_type"] == "gate_decided"]
-                ),
-                "reviews": summarize_review_events(
-                    [event for event in run_events if event["event_type"] == "review_pass_completed"]
-                ),
-                "tokens": summarize_token_events(
-                    [event for event in run_events if event["event_type"] == "token_usage_recorded"]
-                ),
-            }
-        )
-    run_items.sort(key=lambda item: (item["last_timestamp"] or "", item["run_id"]), reverse=True)
 
-    run_range = {"first_timestamp": None, "last_timestamp": None}
-    if runs:
-        run_range = {
-            "first_timestamp": datetime_to_iso(min(run["first_timestamp"] for run in runs.values())),
-            "last_timestamp": datetime_to_iso(max(run["last_timestamp"] for run in runs.values())),
-        }
+def build_reliable_run_item(run: dict[str, Any], run_events: list[dict[str, Any]]) -> dict[str, Any]:
+    start_timestamp = run_start_timestamp(run)
+    end_timestamp = run_end_timestamp(run)
     return {
-        "report_type": "runs",
-        "warning_count": warning_count,
-        "filters": report_filters_public(filters),
-        "run_count": len(runs),
-        "range": run_range,
-        "groups": group_rows,
-        "items": run_items,
+        "run_id": run["run_id"],
+        "repo_path": run["repo_path"],
+        "skill": run["skill"],
+        "status": run_status_from_terminal(run),
+        "data_quality": "confirmed_closed",
+        "duration_seconds": run_duration_seconds(start_timestamp, end_timestamp),
+        "first_timestamp": datetime_to_iso(run["first_timestamp"]),
+        "last_timestamp": datetime_to_iso(run["last_timestamp"]),
+        "start_timestamp": datetime_to_iso(start_timestamp),
+        "end_timestamp": datetime_to_iso(end_timestamp),
+        "validation": summarize_validation_events(
+            [event for event in run_events if event["event_type"] == "validation_attempt"]
+        ),
+        "gates": summarize_gate_events(
+            [event for event in run_events if event["event_type"] == "gate_decided"]
+        ),
+        "reviews": summarize_review_events(
+            [event for event in run_events if event["event_type"] == "review_pass_completed"]
+        ),
+        "tokens": summarize_token_events(
+            [event for event in run_events if event["event_type"] == "token_usage_recorded"]
+        ),
+    }
+
+
+def build_incomplete_run_item(run: dict[str, Any], reason: str) -> dict[str, Any]:
+    start_timestamp = run_start_timestamp(run)
+    end_timestamp = run_end_timestamp(run)
+    return {
+        "run_id": run["run_id"],
+        "repo_path": run["repo_path"],
+        "skill": run["skill"],
+        "status": "excluded",
+        "reason": reason,
+        "data_quality": "incomplete_or_ambiguous",
+        "event_count": len(run["start_events"]) + len(run["terminal_events"]),
+        "first_timestamp": datetime_to_iso(run["first_timestamp"]),
+        "last_timestamp": datetime_to_iso(run["last_timestamp"]),
+        "start_timestamp": datetime_to_iso(start_timestamp),
+        "end_timestamp": datetime_to_iso(end_timestamp),
+    }
+
+
+def run_range(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    run_list = list(runs)
+    if not run_list:
+        return {"first_timestamp": None, "last_timestamp": None}
+    return {
+        "first_timestamp": datetime_to_iso(min(run["first_timestamp"] for run in run_list)),
+        "last_timestamp": datetime_to_iso(max(run["last_timestamp"] for run in run_list)),
     }
 
 
@@ -2153,16 +2249,28 @@ def parse_review_artifact(path: Path) -> dict[str, Any]:
         summary["findings_by_lens"][match.group("lens")] += 1
 
     open_question_lines = [line.strip() for line in sections.get("open questions", []) if line.strip()]
-    if open_question_lines and not (len(open_question_lines) == 1 and open_question_lines[0].lower() == "none"):
+    question_lines = [line for line in open_question_lines if not is_none_artifact_line(line)]
+    if question_lines:
         summary["open_question_count"] = sum(
             1
-            for line in open_question_lines
+            for line in question_lines
             if line.startswith("- ")
             or re.match(r"^\d+\.\s+", line) is not None
-            or line.lower() != "none"
+            or normalize_artifact_list_item(line) != "none"
         )
 
     return summary
+
+
+def is_none_artifact_line(line: str) -> bool:
+    return normalize_artifact_list_item(line) == "none"
+
+
+def normalize_artifact_list_item(line: str) -> str:
+    normalized = line.strip().lower()
+    normalized = re.sub(r"^[-*]\s+", "", normalized)
+    normalized = re.sub(r"^\d+\.\s+", "", normalized)
+    return normalized.strip()
 
 
 def normalize_heading(value: str) -> str:
@@ -2201,14 +2309,101 @@ def review_event_has_artifact_mismatch(metrics: dict[str, Any], parsed: dict[str
 
 def build_reviews_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     review_events = [event for event in events if event["event_type"] == "review_pass_completed"]
-    summary = summarize_review_events(review_events)
+    artifact_events = local_review_artifact_events(filters, referenced_review_artifact_paths(review_events))
+    all_review_events = [*review_events, *artifact_events]
+    summary = summarize_review_events(all_review_events)
+    summary["artifact_summary"]["artifact_only_count"] = len(artifact_events)
     return {
         "report_type": "reviews",
         "warning_count": warning_count,
         "filters": report_filters_public(filters),
         **summary,
-        "range": event_range(review_events),
+        "range": event_range(all_review_events),
     }
+
+
+def referenced_review_artifact_paths(review_events: list[dict[str, Any]]) -> set[str]:
+    paths: set[str] = set()
+    for event in review_events:
+        for path in resolve_review_artifacts(event):
+            paths.add(str(path.resolve(strict=False)))
+    return paths
+
+
+def local_review_artifact_events(filters: dict[str, Any], referenced_paths: set[str]) -> list[dict[str, Any]]:
+    if filters.get("repo") != "current" or filters.get("skill") is not None:
+        return []
+    current_repo = filters.get("_current_repo")
+    if current_repo is None:
+        return []
+    review_dir = Path(current_repo) / ".dreamers" / "reviews"
+    if not review_dir.is_dir():
+        return []
+
+    events: list[dict[str, Any]] = []
+    for path in sorted(review_dir.glob("*.md")):
+        resolved = str(path.resolve(strict=False))
+        if resolved in referenced_paths:
+            continue
+        timestamp = review_artifact_timestamp(path)
+        if not artifact_timestamp_matches_filters(timestamp, filters):
+            continue
+        events.append(build_artifact_review_event(path, current_repo, timestamp))
+    return events
+
+
+def review_artifact_timestamp(path: Path) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return datetime.now(tz=UTC)
+
+
+def artifact_timestamp_matches_filters(timestamp: datetime, filters: dict[str, Any]) -> bool:
+    since = filters.get("_since")
+    until = filters.get("_until")
+    if since is not None and timestamp < since:
+        return False
+    if until is not None and timestamp > until:
+        return False
+    return True
+
+
+def build_artifact_review_event(path: Path, repo_root: Path, timestamp: datetime) -> dict[str, Any]:
+    reviewer = path.name.split("-", 1)[0] or "review"
+    lane = reviewer if reviewer in REVIEW_LANES else "standard"
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": review_artifact_event_id(path, timestamp),
+        "timestamp": datetime_to_iso(timestamp),
+        "_parsed_timestamp": timestamp.astimezone(UTC),
+        "event_type": "review_pass_completed",
+        "repo_path": str(repo_root),
+        "source": "skill",
+        "status": default_status_for_event("review_pass_completed"),
+        "skill": None,
+        "run_id": None,
+        "session_id": None,
+        "metrics": {
+            "review_pass_id": path.stem,
+            "lane": lane,
+            "reviewers": [reviewer],
+            "artifact_paths": [str(path)],
+            "blocked": False,
+            "open_question_count": 0,
+            "findings_by_severity": empty_count_dict(FINDING_SEVERITY_ORDER),
+            "findings_by_lens": empty_count_dict(FINDING_LENS_ORDER),
+            "is_rereview": False,
+            "artifact_only": True,
+        },
+    }
+    return event
+
+
+def review_artifact_event_id(path: Path, timestamp: datetime) -> str:
+    raw = f"{path.resolve(strict=False)}|{datetime_to_iso(timestamp)}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"artifact_review_{digest}"
 
 
 def build_validation_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
@@ -2664,6 +2859,31 @@ def html_run_detail_section(runs: dict[str, Any]) -> str:
     return '<section class="panel run-details"><h2>Run details</h2>' + "".join(details) + "</section>"
 
 
+def html_incomplete_run_section(runs: dict[str, Any]) -> str:
+    items = runs.get("incomplete_items", [])
+    if not items:
+        return ""
+    rows = [
+        [
+            item["run_id"],
+            item["skill"],
+            item["reason"],
+            format_dashboard_timestamp(item["first_timestamp"]),
+            format_dashboard_timestamp(item["last_timestamp"]),
+        ]
+        for item in items
+    ]
+    return (
+        '<section class="panel"><h2>Incomplete / ambiguous runs</h2>'
+        + html_table(
+            ["Run", "Skill", "Reason", "First seen", "Last seen"],
+            rows,
+            "no incomplete or ambiguous runs matched these filters",
+        )
+        + "</section>"
+    )
+
+
 def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: str | None = None) -> str:
     generated = generated_at or utc_now_iso()
     runs = report["runs"]
@@ -2777,7 +2997,7 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             "</header>",
             warning_html,
             '<section class="metrics">',
-            html_metric_card("Runs", runs["run_count"], "skill invocations"),
+            html_metric_card("Runs", runs["run_count"], "reliable skill invocations"),
             html_metric_card("Validation", validation["attempt_count"], f"{validation_failures} failed, {validation_final_failures} final failures"),
             html_metric_card("Reviews", reviews["review_count"], f"{reviews['blocked_count']} blocked, {reviews['open_question_count']} open questions"),
             html_metric_card("Gates", sum(gates["gate_type_counts"].values()), f"{len(gates['gate_type_counts'])} gate types"),
@@ -2791,6 +3011,7 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             ),
             "</section>",
             html_run_detail_section(runs),
+            html_incomplete_run_section(runs),
             '<section class="panel"><h2>Validation</h2>',
             html_table(
                 ["Kind", "Attempts", "Failures", "Retries", "Final passes", "Final failures"],
