@@ -1965,6 +1965,25 @@ def summarize_token_events(token_events: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def candidate_run_keys_for_event_time(
+    event: dict[str, Any], runs: dict[tuple[str, str, str], dict[str, Any]]
+) -> set[tuple[str, str, str]]:
+    timestamp = event["_parsed_timestamp"]
+    candidate_keys: set[tuple[str, str, str]] = set()
+    for run_key, run in runs.items():
+        if event["repo_path"] != run["repo_path"]:
+            continue
+        start_timestamp = run["start_timestamp"] or run["first_timestamp"]
+        end_timestamp = run["end_timestamp"] or run["last_timestamp"]
+        if start_timestamp <= timestamp <= end_timestamp:
+            candidate_keys.add(run_key)
+    return candidate_keys
+
+
+def unscoped_token_fallback_allowed(filters: dict[str, Any]) -> bool:
+    return filters.get("skill") is None and filters.get("_since") is None and filters.get("_until") is None
+
+
 def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters: dict[str, Any]) -> dict[str, Any]:
     runs: dict[tuple[str, str, str], dict[str, Any]] = {}
     events_by_run: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -2006,9 +2025,11 @@ def build_runs_report(events: list[dict[str, Any]], warning_count: int, filters:
         if event["event_type"] != "token_usage_recorded" or run_key_for_event(event) is not None:
             continue
         session_id = event.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            continue
-        candidate_keys = run_keys_by_session.get((event["repo_path"], session_id), set())
+        candidate_keys: set[tuple[str, str, str]] = set()
+        if unscoped_token_fallback_allowed(filters) and isinstance(session_id, str) and session_id:
+            candidate_keys = run_keys_by_session.get((event["repo_path"], session_id), set())
+        if len(candidate_keys) != 1 and unscoped_token_fallback_allowed(filters):
+            candidate_keys = candidate_run_keys_for_event_time(event, runs)
         if len(candidate_keys) == 1:
             events_by_run[next(iter(candidate_keys))].append(event)
 
@@ -2484,6 +2505,24 @@ def format_dashboard_timestamp(value: Any) -> str:
     return f"{parsed.strftime('%b')} {parsed.day}, {parsed.year} {parsed:%H:%M} UTC"
 
 
+def format_dashboard_run_name(run: dict[str, Any]) -> str:
+    repo_path = str(run.get("repo_path") or "").strip()
+    normalized_path = repo_path.replace("\\", "/").rstrip("/")
+    path_label = normalized_path.rsplit("/", 1)[-1] or "unknown"
+    timestamp = run.get("start_timestamp") or run.get("first_timestamp")
+    try:
+        parsed = parse_iso_timestamp(str(timestamp)).astimezone(UTC)
+    except StatsValidationError:
+        return f"{path_label}-unknown-time"
+    return f"{path_label}-{parsed:%y%m%d-%H:%M}"
+
+
+def format_dashboard_token_summary(value: Any) -> str:
+    if value is None:
+        return "n/a tokens"
+    return f"{format_dashboard_number(value)} tokens"
+
+
 def dashboard_range_text(report: dict[str, Any]) -> str:
     timestamps: list[datetime] = []
     for section_name in ("runs", "reviews", "validation", "gates", "tokens"):
@@ -2575,8 +2614,8 @@ def dashboard_token_metric(tokens: dict[str, Any]) -> tuple[Any, str]:
     if tokens["estimated"]["row_count"]:
         return tokens["estimated"]["totals"]["total_tokens"], "estimated total"
     if tokens["unavailable"]["row_count"]:
-        return "n/a", "unavailable totals"
-    return 0, "exact total"
+        return None, "unavailable totals"
+    return None, "no token rows"
 
 
 def html_run_detail_section(runs: dict[str, Any]) -> str:
@@ -2621,14 +2660,17 @@ def html_run_detail_section(runs: dict[str, Any]) -> str:
                 [
                     '<details class="run-detail">',
                     "<summary>",
-                    f'<span class="run-id">{html_text(run["run_id"])}</span>',
+                    f'<span class="run-name">{html_text(format_dashboard_run_name(run))}</span>',
                     f'<span>{html_text(run["skill"])}</span>',
+                    f'<span class="run-tokens">{html_text(format_dashboard_token_summary(token_value))}</span>',
                     str(html_status_badge(run["status"])),
                     f'<span>{html_text(format_duration(run["duration_seconds"]))}</span>',
                     "</summary>",
                     '<div class="run-detail-body">',
                     html_definition_list(
                         [
+                            ("run id", run["run_id"]),
+                            ("repo path", run["repo_path"]),
                             ("first seen", format_dashboard_timestamp(run["first_timestamp"])),
                             ("last seen", format_dashboard_timestamp(run["last_timestamp"])),
                             ("validation attempts", validation["attempt_count"]),
@@ -2764,7 +2806,7 @@ def render_dashboard_html(report: dict[str, Any], *, client: str, generated_at: 
             "table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 6px;vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase}",
             ".status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:#eef3f0;color:var(--muted)}.status-completed{background:#e6f4eb;color:var(--ok)}.status-in-progress{background:#e8f1fb;color:var(--active)}.status-halted{background:#fff0e6;color:var(--hold)}",
             "dl{display:grid;gap:8px;margin:0}dl div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:6px 0}dt{color:var(--muted)}dd{margin:0;text-align:right}.empty{color:var(--muted)}",
-            ".run-detail{border:1px solid var(--line);border-radius:8px;margin:10px 0;background:#fbfdfb}.run-detail summary{cursor:pointer;display:grid;grid-template-columns:minmax(180px,1fr) minmax(120px,.7fr) auto auto;gap:12px;align-items:center;padding:12px 14px}.run-id{font-weight:700}.run-detail-body{padding:0 14px 14px}.run-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px}.run-detail h3{font-size:14px;margin:0 0 8px;color:var(--muted);text-transform:uppercase}@media(max-width:700px){.run-detail summary{grid-template-columns:1fr}}",
+            ".run-detail{border:1px solid var(--line);border-radius:8px;margin:10px 0;background:#fbfdfb}.run-detail summary{cursor:pointer;display:grid;grid-template-columns:minmax(220px,1fr) minmax(120px,.55fr) minmax(90px,.4fr) auto auto;gap:12px;align-items:center;padding:12px 14px}.run-name,.run-tokens{font-weight:700}.run-detail-body{padding:0 14px 14px}.run-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px}.run-detail h3{font-size:14px;margin:0 0 8px;color:var(--muted);text-transform:uppercase}@media(max-width:700px){.run-detail summary{grid-template-columns:1fr}}",
             "</style>",
             "</head>",
             "<body>",

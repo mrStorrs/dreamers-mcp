@@ -1210,6 +1210,536 @@ class SharedStatsTests(unittest.TestCase):
         items = {item["run_id"]: item for item in report["items"]}
         self.assertEqual(100, items["run_detail_hook_01"]["tokens"]["exact"]["totals"]["total_tokens"])
 
+    def test_runs_report_correlates_unscoped_token_events_by_unique_run_window(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_window_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_detail_window_01",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_window_tokens",
+                timestamp="2026-06-15T10:02:00Z",
+                session_id="session_without_skill_checkpoint",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_window_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_detail_window_01",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertEqual(135, items["run_detail_window_01"]["tokens"]["exact"]["totals"]["total_tokens"])
+
+    def test_runs_report_falls_back_to_unique_window_when_session_has_multiple_runs(self):
+        session_id = "session_multi_run_window"
+        for run_id, start, end in (
+            ("run_detail_multi_session_01", "10:00:00", "10:01:00"),
+            ("run_detail_multi_session_02", "10:02:00", "10:05:00"),
+        ):
+            self.record_fixture_event(
+                self.fixture_event(
+                    "skill_started",
+                    event_id=f"evt_{run_id}_start",
+                    timestamp=f"2026-06-15T{start}Z",
+                    run_id=run_id,
+                    session_id=session_id,
+                    skill="dreamers-lite",
+                    metrics={"mode": "task-description"},
+                ),
+                client="codex",
+                home=self.codex_home,
+            )
+            self.record_fixture_event(
+                self.fixture_event(
+                    "skill_completed",
+                    event_id=f"evt_{run_id}_done",
+                    timestamp=f"2026-06-15T{end}Z",
+                    run_id=run_id,
+                    session_id=session_id,
+                    skill="dreamers-lite",
+                    metrics={"final_status": "completed"},
+                ),
+                client="codex",
+                home=self.codex_home,
+            )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_multi_session_tokens",
+                timestamp="2026-06-15T10:03:00Z",
+                session_id=session_id,
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertEqual(0, items["run_detail_multi_session_01"]["tokens"]["exact"]["row_count"])
+        self.assertEqual(
+            135,
+            items["run_detail_multi_session_02"]["tokens"]["exact"]["totals"]["total_tokens"],
+        )
+
+    def test_runs_report_does_not_guess_token_events_for_overlapping_run_windows(self):
+        for run_id, offset in (("run_detail_overlap_01", "10:00:00"), ("run_detail_overlap_02", "10:01:00")):
+            self.record_fixture_event(
+                self.fixture_event(
+                    "skill_started",
+                    event_id=f"evt_{run_id}_start",
+                    timestamp=f"2026-06-15T{offset}Z",
+                    run_id=run_id,
+                    skill="dreamers-lite",
+                    metrics={"mode": "task-description"},
+                ),
+                client="codex",
+                home=self.codex_home,
+            )
+            self.record_fixture_event(
+                self.fixture_event(
+                    "skill_completed",
+                    event_id=f"evt_{run_id}_done",
+                    timestamp="2026-06-15T10:05:00Z",
+                    run_id=run_id,
+                    skill="dreamers-lite",
+                    metrics={"final_status": "completed"},
+                ),
+                client="codex",
+                home=self.codex_home,
+            )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_overlap_tokens",
+                timestamp="2026-06-15T10:02:00Z",
+                session_id="session_overlapping_runs",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertEqual(0, items["run_detail_overlap_01"]["tokens"]["exact"]["row_count"])
+        self.assertEqual(0, items["run_detail_overlap_02"]["tokens"]["exact"]["row_count"])
+
+    def test_runs_report_disables_timestamp_token_fallback_when_date_filters_can_hide_overlaps(self):
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_filtered_visible_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_detail_filtered_visible",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_filtered_visible_done",
+                timestamp="2026-06-15T10:03:00Z",
+                run_id="run_detail_filtered_visible",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_filtered_hidden_start",
+                timestamp="2026-06-15T09:55:00Z",
+                run_id="run_detail_filtered_hidden",
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_filtered_hidden_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_detail_filtered_hidden",
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_filtered_tokens",
+                timestamp="2026-06-15T10:02:00Z",
+                session_id="session_filtered_overlap",
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            since="2026-06-15T10:00:00Z",
+            until="2026-06-15T10:04:00Z",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertIn("run_detail_filtered_visible", items)
+        self.assertNotIn("run_detail_filtered_hidden", items)
+        self.assertEqual(0, items["run_detail_filtered_visible"]["tokens"]["exact"]["row_count"])
+
+    def test_runs_report_disables_session_token_fallback_when_date_filters_can_hide_overlaps(self):
+        session_id = "session_filtered_overlap"
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_filtered_session_visible_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_detail_filtered_session_visible",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_filtered_session_visible_done",
+                timestamp="2026-06-15T10:03:00Z",
+                run_id="run_detail_filtered_session_visible",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_filtered_session_hidden_start",
+                timestamp="2026-06-15T09:55:00Z",
+                run_id="run_detail_filtered_session_hidden",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_filtered_session_hidden_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_detail_filtered_session_hidden",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_filtered_session_tokens",
+                timestamp="2026-06-15T10:02:00Z",
+                session_id=session_id,
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            since="2026-06-15T10:00:00Z",
+            until="2026-06-15T10:04:00Z",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertIn("run_detail_filtered_session_visible", items)
+        self.assertNotIn("run_detail_filtered_session_hidden", items)
+        self.assertEqual(0, items["run_detail_filtered_session_visible"]["tokens"]["exact"]["row_count"])
+
+    def test_runs_report_disables_unscoped_token_fallback_when_skill_filter_can_hide_competitors(self):
+        session_id = "session_skill_filter"
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_skill_visible_start",
+                timestamp="2026-06-15T10:00:00Z",
+                run_id="run_detail_skill_visible",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_skill_visible_done",
+                timestamp="2026-06-15T10:05:00Z",
+                run_id="run_detail_skill_visible",
+                session_id=session_id,
+                skill="dreamers-lite",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_started",
+                event_id="evt_run_detail_skill_hidden_start",
+                timestamp="2026-06-15T10:01:00Z",
+                run_id="run_detail_skill_hidden",
+                session_id=session_id,
+                skill="dreamers-full",
+                metrics={"mode": "task-description"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "skill_completed",
+                event_id="evt_run_detail_skill_hidden_done",
+                timestamp="2026-06-15T10:04:00Z",
+                run_id="run_detail_skill_hidden",
+                session_id=session_id,
+                skill="dreamers-full",
+                metrics={"final_status": "completed"},
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+        self.record_fixture_event(
+            self.fixture_event(
+                "token_usage_recorded",
+                event_id="evt_run_detail_skill_filter_tokens",
+                timestamp="2026-06-15T10:02:00Z",
+                session_id=session_id,
+                source="summary",
+                metrics={
+                    "token_source": "exact",
+                    "model": "gpt-5",
+                    "attribution_scope": "turn",
+                    "input_tokens": 120,
+                    "output_tokens": 15,
+                    "total_tokens": 135,
+                    "ai_credits": 0.5,
+                },
+            ),
+            client="codex",
+            home=self.codex_home,
+        )
+
+        report = runtime.run_report(
+            "runs",
+            client="codex",
+            home=self.codex_home,
+            repo="current",
+            skill="dreamers-lite",
+            cwd=self.fixture_repo,
+        )
+
+        items = {item["run_id"]: item for item in report["items"]}
+        self.assertIn("run_detail_skill_visible", items)
+        self.assertNotIn("run_detail_skill_hidden", items)
+        self.assertEqual(0, items["run_detail_skill_visible"]["tokens"]["exact"]["row_count"])
+
+    def test_dashboard_run_name_uses_repo_basename_and_utc_start_time(self):
+        run = {
+            "repo_path": "/tmp/fixture-repo",
+            "start_timestamp": "2026-06-13T10:00:00Z",
+            "first_timestamp": "2026-06-13T10:00:00Z",
+        }
+        self.assertEqual("fixture-repo-260613-10:00", runtime.format_dashboard_run_name(run))
+
+        windows_run = {
+            "repo_path": "C:\\projects\\dreamers-mcp",
+            "start_timestamp": "2026-06-13T10:00:00Z",
+            "first_timestamp": "2026-06-13T10:00:00Z",
+        }
+        self.assertEqual("dreamers-mcp-260613-10:00", runtime.format_dashboard_run_name(windows_run))
+
+    def test_dashboard_run_name_falls_back_for_invalid_timestamp(self):
+        run = {
+            "repo_path": "/tmp/fixture-repo",
+            "start_timestamp": "not-a-time",
+            "first_timestamp": "2026-06-13T10:00:00Z",
+        }
+        self.assertEqual("fixture-repo-unknown-time", runtime.format_dashboard_run_name(run))
+
+    def test_dashboard_run_detail_section_renders_summary_tokens_and_debug_fields(self):
+        run = {
+            "run_id": "run_dashboard_detail_01",
+            "repo_path": "/tmp/fixture-repo",
+            "skill": "dreamers-full",
+            "status": "completed",
+            "duration_seconds": 300,
+            "first_timestamp": "2026-06-13T10:00:00Z",
+            "last_timestamp": "2026-06-13T10:05:00Z",
+            "start_timestamp": "2026-06-13T10:00:00Z",
+            "end_timestamp": "2026-06-13T10:05:00Z",
+            "validation": {"attempt_count": 0, "command_kinds": {}},
+            "gates": {"gate_type_counts": {}, "decision_counts": {}},
+            "reviews": {"review_count": 0, "open_question_count": 0},
+            "tokens": {
+                "exact": {"row_count": 1, "totals": {"total_tokens": 42}},
+                "estimated": {"row_count": 0, "totals": {"total_tokens": 0}},
+                "unavailable": {"row_count": 0, "totals": {"total_tokens": None}},
+            },
+        }
+
+        html_text = runtime.html_run_detail_section({"items": [run]})
+
+        self.assertIn("fixture-repo-260613-10:00", html_text)
+        self.assertIn('<span class="run-tokens">42 tokens</span>', html_text)
+        self.assertIn("<dt>run id</dt><dd>run_dashboard_detail_01</dd>", html_text)
+        self.assertIn("<dt>repo path</dt><dd>/tmp/fixture-repo</dd>", html_text)
+
+    def test_dashboard_run_detail_section_marks_missing_tokens_as_na(self):
+        run = {
+            "run_id": "run_dashboard_detail_01",
+            "repo_path": "/tmp/fixture-repo",
+            "skill": "dreamers-full",
+            "status": "completed",
+            "duration_seconds": 300,
+            "first_timestamp": "2026-06-13T10:00:00Z",
+            "last_timestamp": "2026-06-13T10:05:00Z",
+            "start_timestamp": "2026-06-13T10:00:00Z",
+            "end_timestamp": "2026-06-13T10:05:00Z",
+            "validation": {"attempt_count": 0, "command_kinds": {}},
+            "gates": {"gate_type_counts": {}, "decision_counts": {}},
+            "reviews": {"review_count": 0, "open_question_count": 0},
+            "tokens": {
+                "exact": {"row_count": 0, "totals": {"total_tokens": 0}},
+                "estimated": {"row_count": 0, "totals": {"total_tokens": 0}},
+                "unavailable": {"row_count": 0, "totals": {"total_tokens": None}},
+            },
+        }
+
+        html_text = runtime.html_run_detail_section({"items": [run]})
+
+        self.assertIn('<span class="run-tokens">n/a tokens</span>', html_text)
+        self.assertIn("<dt>token total</dt><dd>n/a</dd>", html_text)
+        self.assertIn("<dt>token source</dt><dd>no token rows</dd>", html_text)
+
+    def test_dashboard_token_summary_formats_count(self):
+        self.assertEqual("1,234 tokens", runtime.format_dashboard_token_summary(1234))
+        self.assertEqual("n/a tokens", runtime.format_dashboard_token_summary(None))
+
     def test_dashboard_command_writes_standalone_html_file(self):
         self.record_fixture_event(
             self.fixture_event(
@@ -1365,10 +1895,12 @@ class SharedStatsTests(unittest.TestCase):
             ),
         ]
         for event in events:
+            event["repo_path"] = "/tmp/fixture-repo"
+            event["repo_name"] = "fixture-repo"
             self.record_fixture_event(event)
 
         code, stdout, stderr = self.invoke(
-            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "current"],
+            ["dashboard", "--client", "copilot", "--home", str(self.copilot_home), "--repo", "all"],
             cwd=self.fixture_repo,
         )
 
@@ -1377,6 +1909,11 @@ class SharedStatsTests(unittest.TestCase):
         self.assertIn('<section class="panel run-details"><h2>Run details</h2>', stdout)
         self.assertIn('<details class="run-detail">', stdout)
         self.assertIn("run_dashboard_detail_01", stdout)
+        self.assertIn("fixture-repo-260613-10:00", stdout)
+        self.assertNotIn("tmp.fixture-repo-260613-10:00", stdout)
+        self.assertIn('<span class="run-tokens">42 tokens</span>', stdout)
+        self.assertIn("<dt>run id</dt><dd>run_dashboard_detail_01</dd>", stdout)
+        self.assertIn("<dt>repo path</dt><dd>/tmp/fixture-repo</dd>", stdout)
         self.assertIn("<dt>validation attempts</dt><dd>1</dd>", stdout)
         self.assertIn("<dt>gate decisions</dt><dd>1</dd>", stdout)
         self.assertIn("<dt>review passes</dt><dd>1</dd>", stdout)
