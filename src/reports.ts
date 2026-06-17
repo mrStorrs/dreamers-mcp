@@ -176,6 +176,7 @@ function buildReportFilters(options: ReportOptions): JsonRecord {
     _since: parsedSince,
     _until: parsedUntil,
     _current_repo: currentRepo,
+    _client: options.client ?? null,
   };
 }
 
@@ -988,8 +989,26 @@ function buildTokensReport(events: JsonRecord[], warningCount: number, filters: 
   };
 }
 
-function buildSummaryReport(events: JsonRecord[], warningCount: number, filters: JsonRecord): JsonRecord {
+function buildWorkflowReport(events: JsonRecord[]): JsonRecord {
+  const cycleStatusCounts: JsonRecord = {};
+  for (const event of events) {
+    if (event.event_type !== "cycle_completed") {
+      continue;
+    }
+    const cycleStatus = event.metrics.cycle_status;
+    if (typeof cycleStatus === "string" && cycleStatus) {
+      cycleStatusCounts[cycleStatus] = (cycleStatusCounts[cycleStatus] ?? 0) + 1;
+    }
+  }
   return {
+    cycle_status_counts: sortObject(cycleStatusCounts),
+    pr_count: events.filter((event) => event.event_type === "pr_created").length,
+    retro_count: events.filter((event) => event.event_type === "retro_written").length,
+  };
+}
+
+function buildSummaryReport(events: JsonRecord[], warningCount: number, filters: JsonRecord): JsonRecord {
+  const report: JsonRecord = {
     report_type: "summarize",
     warning_count: warningCount,
     filters: reportFiltersPublic(filters),
@@ -999,6 +1018,10 @@ function buildSummaryReport(events: JsonRecord[], warningCount: number, filters:
     gates: buildGatesReport(events, warningCount, filters),
     tokens: buildTokensReport(events, warningCount, filters),
   };
+  if (filters._client === "copilot") {
+    report.workflow_outputs = buildWorkflowReport(events);
+  }
+  return report;
 }
 
 function reportFiltersPublic(filters: JsonRecord): JsonRecord {

@@ -1,5 +1,6 @@
 export { StatsValidationError } from "./errors.js";
 export type * from "./types.js";
+export { buildCheckpointEvent } from "./checkpoints.js";
 export {
   defaultClientHome,
   defaultStatusForEvent,

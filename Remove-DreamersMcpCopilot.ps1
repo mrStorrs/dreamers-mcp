@@ -39,6 +39,15 @@ function Resolve-ManifestSourcePath {
     if ($RelativePath.StartsWith("dreamers/runtime/dreamers_stats/")) {
         return Join-Path $RepoRoot ($RelativePath.Replace("dreamers/runtime/dreamers_stats/", "dreamers_stats/"))
     }
+    if ($RelativePath -eq "dreamers/runtime/dreamers_mcp_node/package.json") {
+        return Join-Path $RepoRoot "package.json"
+    }
+    if ($RelativePath.StartsWith("dreamers/runtime/dreamers_mcp_node/dist/")) {
+        return Join-Path $RepoRoot ($RelativePath.Replace("dreamers/runtime/dreamers_mcp_node/dist/", "dist/"))
+    }
+    if ($RelativePath -eq "dreamers/scripts/dreamers_node_launcher.py") {
+        return Join-Path $RepoRoot "bundles/shared/scripts/dreamers_node_launcher.py"
+    }
     if ($RelativePath.StartsWith("dreamers/scripts/")) {
         return Join-Path $RepoRoot ($RelativePath.Replace("dreamers/scripts/", "bundles/copilot/scripts/"))
     }
@@ -106,6 +115,8 @@ if (-not $DryRun) {
     }
     Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "install-state")
     Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "runtime" "dreamers_stats")
+    Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "runtime" "dreamers_mcp_node" "dist")
+    Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "runtime" "dreamers_mcp_node")
     Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "runtime")
     Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers" "scripts")
     Remove-EmptyDirectory -Path (Join-Path $CopilotHome "dreamers")

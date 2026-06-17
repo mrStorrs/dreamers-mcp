@@ -8,13 +8,17 @@
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "dreamers-stats": "./dist/cli.js",
+    "dreamers-stats-mcp": "./dist/mcp-server.js"
+  },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "test:unit": "vitest run tests-ts/runtime.test.ts"
   },
   "devDependencies": {

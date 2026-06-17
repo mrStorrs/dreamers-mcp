@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+from dreamers_node_launcher import find_node_runtime_root, run_node_entrypoint
+
 
 def _runtime_candidate(path: Path) -> Path | None:
     candidate = path.expanduser()
@@ -41,12 +43,17 @@ def _needs_home_args(arguments: list[str]) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
-    runtime_root = _find_runtime_root()
-    sys.path.insert(0, str(runtime_root))
-    from dreamers_stats.cli import main as runtime_main
-
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
+        node_root = find_node_runtime_root("cli.js", __file__)
+        if node_root is not None:
+            node_result = run_node_entrypoint(node_root, "cli.js", arguments)
+            if node_result is not None:
+                return node_result
+        runtime_root = _find_runtime_root()
+        sys.path.insert(0, str(runtime_root))
+        from dreamers_stats.cli import main as runtime_main
+
         return runtime_main(arguments)
 
     command, *tail = arguments
@@ -56,6 +63,16 @@ def main(argv: list[str] | None = None) -> int:
     if _needs_home_args(arguments):
         runtime_args.extend(["--home", os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))])
     runtime_args.extend(tail)
+
+    node_root = find_node_runtime_root("cli.js", __file__)
+    if node_root is not None:
+        node_result = run_node_entrypoint(node_root, "cli.js", runtime_args)
+        if node_result is not None:
+            return node_result
+
+    runtime_root = _find_runtime_root()
+    sys.path.insert(0, str(runtime_root))
+    from dreamers_stats.cli import main as runtime_main
     return runtime_main(runtime_args)
 
 
