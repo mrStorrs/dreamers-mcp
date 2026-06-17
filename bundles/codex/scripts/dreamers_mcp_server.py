@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+from dreamers_node_launcher import find_node_runtime_root, run_node_entrypoint
+
 
 def _runtime_candidate(path: Path) -> Path | None:
     candidate = path.expanduser()
@@ -32,6 +34,12 @@ def _find_runtime_root() -> Path:
 
 
 def main() -> int:
+    node_root = find_node_runtime_root("mcp-server.js", __file__)
+    if node_root is not None:
+        node_result = run_node_entrypoint(node_root, "mcp-server.js", [])
+        if node_result is not None:
+            return node_result
+
     runtime_root = _find_runtime_root()
     sys.path.insert(0, str(runtime_root))
     from dreamers_stats.mcp_server import serve

@@ -1,0 +1,31 @@
+{
+  "name": "dreamers-mcp",
+  "version": "0.1.0",
+  "description": "Shared Dreamers stats runtime, CLI, and MCP server.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "dreamers-stats": "./dist/cli.js",
+    "dreamers-stats-mcp": "./dist/mcp-server.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --no-file-parallelism",
+    "test:unit": "vitest run tests-ts/runtime.test.ts",
+    "test:compat": "node tests-ts/run-compat-tests.mjs",
+    "validate": "npm run typecheck && npm test && npm run build && npm run test:compat"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}

@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
+from dreamers_node_launcher import find_node_runtime_root, run_node_entrypoint
+
 
 class StatsValidationError(Exception):
     def __init__(self, category: str, message: str) -> None:
@@ -266,12 +268,20 @@ def record_event(event: dict[str, Any], copilot_home: str | Path | None = None) 
 
 
 def main(argv: list[str] | None = None, stdin: TextIO | None = None) -> int:
+    args = _normalize_argv(argv)
+    if stdin is None:
+        node_root = find_node_runtime_root("cli.js", __file__)
+        if node_root is not None:
+            node_result = run_node_entrypoint(node_root, "cli.js", args)
+            if node_result is not None:
+                return node_result
+
     try:
         runtime = _load_shared_runtime()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    return runtime.main(_normalize_argv(argv), stdin=stdin)
+    return runtime.main(args, stdin=stdin)
 
 
 def os_environ(key: str) -> str | None:

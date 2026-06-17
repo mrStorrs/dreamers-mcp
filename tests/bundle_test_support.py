@@ -25,6 +25,8 @@ COPILOT_POWERSHELL_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_h
 COPILOT_SHIM_RELATIVE = Path("dreamers") / "scripts" / "dreamers_stats.py"
 COPILOT_HOOK_CONFIG_RELATIVE = Path("hooks") / "dreamers-stats.json"
 INSTALLED_RUNTIME_PACKAGE_RELATIVE = Path("dreamers") / "runtime" / "dreamers_stats"
+INSTALLED_NODE_RUNTIME_RELATIVE = Path("dreamers") / "runtime" / "dreamers_mcp_node"
+INSTALLED_NODE_DIST_RELATIVE = INSTALLED_NODE_RUNTIME_RELATIVE / "dist"
 RUNTIME_INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "runtime-hooks.txt"
 CODEX_BASH_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.sh"
 CODEX_POWERSHELL_WRAPPER_RELATIVE = Path("dreamers") / "scripts" / "dreamers_hook.ps1"
@@ -101,6 +103,14 @@ class BundleTestCase(unittest.TestCase):
             path_key, hash_value = line.split("|", 1)
             entries[path_key] = hash_value
         return entries
+
+    def make_alt_node_runtime(self):
+        runtime_root = Path(self.tmp.name) / "alt-node-runtime"
+        target = runtime_root / "dreamers_mcp_node"
+        target.mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "package.json", target / "package.json")
+        shutil.copytree(REPO_ROOT / "dist", target / "dist")
+        return runtime_root
 
     def powershell_command(self):
         if shutil.which("pwsh"):

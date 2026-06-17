@@ -21,6 +21,7 @@ HOOK_EVENTS = (
 )
 INSTALL_STATE_RELATIVE = Path("dreamers") / "install-state" / "codex-bundle.json"
 RUNTIME_TARGET_RELATIVE = Path("dreamers") / "runtime" / "dreamers_stats"
+NODE_RUNTIME_TARGET_RELATIVE = Path("dreamers") / "runtime" / "dreamers_mcp_node"
 SCRIPTS_TARGET_RELATIVE = Path("dreamers") / "scripts"
 REFS_TARGET_RELATIVE = Path("dreamers") / "refs"
 AGENTS_CONFIG_RELATIVE = Path("AGENTS.md")
@@ -38,8 +39,15 @@ REQUIRED_MANAGED_BUNDLE_KEYS = {
     for name in RUNTIME_FILES
 }
 REQUIRED_MANAGED_BUNDLE_KEYS.update(
+    {
+        (NODE_RUNTIME_TARGET_RELATIVE / "package.json").as_posix(),
+        (NODE_RUNTIME_TARGET_RELATIVE / "dist" / "cli.js").as_posix(),
+        (NODE_RUNTIME_TARGET_RELATIVE / "dist" / "mcp-server.js").as_posix(),
+    }
+)
+REQUIRED_MANAGED_BUNDLE_KEYS.update(
     (SCRIPTS_TARGET_RELATIVE / name).as_posix()
-    for name in ("dreamers_hook.ps1", "dreamers_hook.sh", "dreamers_mcp_server.py", "dreamers_stats.py")
+    for name in ("dreamers_hook.ps1", "dreamers_hook.sh", "dreamers_mcp_server.py", "dreamers_node_launcher.py", "dreamers_stats.py")
 )
 REQUIRED_MANAGED_BUNDLE_KEYS.add((REFS_TARGET_RELATIVE / STATS_REF_NAME).as_posix())
 
@@ -87,7 +95,10 @@ def write_manifest(codex_home: Path, manifest: dict[str, object]) -> None:
 def resolve_checkout_root(candidate: str | Path | None, fallback_root: Path) -> Path:
     checkout_root = Path(candidate).expanduser() if candidate else fallback_root
     package_dir = checkout_root / "dreamers_stats"
+    node_package = checkout_root / "package.json"
+    dist_dir = checkout_root / "dist"
     scripts_dir = checkout_root / "bundles" / "codex" / "scripts"
+    shared_scripts_dir = checkout_root / "bundles" / "shared" / "scripts"
     refs_dir = checkout_root / "bundles" / "codex" / "refs"
     if not package_dir.is_dir():
         raise RuntimeError(
@@ -97,8 +108,19 @@ def resolve_checkout_root(candidate: str | Path | None, fallback_root: Path) -> 
     for name in RUNTIME_FILES:
         if not (package_dir / name).is_file():
             raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing dreamers_stats/{name}.")
+    if not node_package.is_file():
+        raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing package.json.")
+    for name in ("cli.js", "mcp-server.js", "index.js"):
+        if not (dist_dir / name).is_file():
+            raise RuntimeError(
+                f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing dist/{name}. Run npm run build first."
+            )
     if not scripts_dir.is_dir():
         raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is missing bundles/codex/scripts.")
+    if not (shared_scripts_dir / "dreamers_node_launcher.py").is_file():
+        raise RuntimeError(
+            f"dreamers-mcp checkout at '{checkout_root}' is incomplete; missing bundles/shared/scripts/dreamers_node_launcher.py."
+        )
     if not refs_dir.is_dir():
         raise RuntimeError(f"dreamers-mcp checkout at '{checkout_root}' is missing bundles/codex/refs.")
     if not (refs_dir / STATS_REF_NAME).is_file():
@@ -116,9 +138,21 @@ def iter_runtime_sources(checkout_root: Path) -> list[tuple[Path, Path]]:
     ]
 
 
+def iter_node_runtime_sources(checkout_root: Path) -> list[tuple[Path, Path]]:
+    sources = [(checkout_root / "package.json", NODE_RUNTIME_TARGET_RELATIVE / "package.json")]
+    dist_dir = checkout_root / "dist"
+    sources.extend(
+        (path, NODE_RUNTIME_TARGET_RELATIVE / "dist" / path.relative_to(dist_dir))
+        for path in sorted(dist_dir.rglob("*"))
+        if path.is_file()
+    )
+    return sources
+
+
 def iter_bundle_sources(checkout_root: Path) -> list[tuple[Path, Path]]:
     sources: list[tuple[Path, Path]] = []
     bundle_directories = (
+        (checkout_root / "bundles" / "shared" / "scripts", SCRIPTS_TARGET_RELATIVE),
         (checkout_root / "bundles" / "codex" / "scripts", SCRIPTS_TARGET_RELATIVE),
         (checkout_root / "bundles" / "codex" / "refs", REFS_TARGET_RELATIVE),
     )
@@ -141,7 +175,11 @@ def copy_bundle_files(
     previous_files = previous_manifest if isinstance(previous_manifest, dict) else {}
     managed_files: dict[str, str] = {}
     copied = 0
-    for source_path, relative_path in [*iter_runtime_sources(checkout_root), *iter_bundle_sources(checkout_root)]:
+    for source_path, relative_path in [
+        *iter_runtime_sources(checkout_root),
+        *iter_node_runtime_sources(checkout_root),
+        *iter_bundle_sources(checkout_root),
+    ]:
         target_path = codex_home / relative_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         source_hash = sha256_path(source_path)
