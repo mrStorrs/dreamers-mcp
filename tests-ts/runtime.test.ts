@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -413,6 +413,98 @@ describe("hook event conversion and token harvesting", () => {
       model: "gpt-test",
     });
   });
+
+  it("accepts docs-shaped Codex hook payloads without timestamps", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-docs-hooks-"));
+    const before = Date.now() - 1_000;
+
+    const sessionStart = buildHookEvent("SessionStart", {
+      cwd: "/tmp/example",
+      source: "startup",
+      session_id: "session_docs",
+    });
+    const prompt = buildHookEvent("UserPromptSubmit", {
+      cwd: "/tmp/example",
+      prompt: "do not store prompt text",
+      turn_id: "turn_docs",
+      session_id: "session_docs",
+    });
+    const stopEvents = await buildHookEvents(
+      "Stop",
+      {
+        cwd: "/tmp/example",
+        stop_hook_active: false,
+        last_assistant_message: "do not store assistant text",
+        turn_id: "turn_docs",
+        session_id: "session_docs",
+      },
+      { client: "codex", home },
+    );
+    const after = Date.now() + 1_000;
+
+    const events = [sessionStart, prompt, ...stopEvents];
+    expect(events.map((event) => event.event_type)).toEqual([
+      "session_started",
+      "prompt_submitted",
+      "turn_completed",
+      "token_usage_recorded",
+    ]);
+    for (const event of events) {
+      const timestamp = Date.parse(event.timestamp);
+      expect(timestamp).toBeGreaterThanOrEqual(before);
+      expect(timestamp).toBeLessThanOrEqual(after);
+    }
+    expect(events.map((event) => JSON.stringify(event)).join("\n")).not.toContain("do not store");
+  });
+
+  it("matches exact Codex session filenames instead of newer overlapping names", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-codex-overlap-"));
+    const sessionDir = join(home, "sessions", "2026", "06", "15");
+    await mkdir(sessionDir, { recursive: true });
+    const wrongPath = join(sessionDir, "rollout-2026-06-15T00-00-00-session_overlap_extra.jsonl");
+    const correctPath = join(sessionDir, "rollout-2026-06-15T00-00-00-session_overlap.jsonl");
+    await writeFile(
+      wrongPath,
+      `${JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: { input_tokens: 900, output_tokens: 99, total_tokens: 999 } },
+        },
+      })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      correctPath,
+      `${JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: { input_tokens: 100, output_tokens: 23, total_tokens: 123 } },
+        },
+      })}\n`,
+      "utf8",
+    );
+    await utimes(correctPath, 1_718_302_400, 1_718_302_400);
+    await utimes(wrongPath, 1_718_302_500, 1_718_302_500);
+
+    const events = await buildHookEvents(
+      "Stop",
+      {
+        cwd: "/tmp/example",
+        timestamp: "2026-06-15T00:02:00Z",
+        session_id: "session_overlap",
+        stop_hook_active: false,
+      },
+      { client: "codex", home },
+    );
+
+    expect(events).toHaveLength(2);
+    expect(events[1]!.metrics).toMatchObject({
+      token_source: "exact",
+      total_tokens: 123,
+    });
+  });
 });
 
 describe("report builders and dashboard rendering", () => {
@@ -719,5 +811,174 @@ describe("report builders and dashboard rendering", () => {
     expect(html).toContain("<td>n/a</td>");
     expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     expect(html).not.toContain("<script>alert(1)</script>");
+  });
+
+  it("reports individual run details, retries, gates, reviews, and attributed hook tokens", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-run-details-"));
+    const repoPath = await makeTempRepo(home, "repo");
+    const sessionId = "session_run_detail_hook";
+    const sessionPath = join(
+      home,
+      "sessions",
+      "2026",
+      "06",
+      "15",
+      `rollout-2026-06-15T10-04-00-${sessionId}.jsonl`,
+    );
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(
+      sessionPath,
+      `${JSON.stringify({
+        timestamp: "2026-06-15T10:04:00Z",
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            model: "gpt-5",
+            last_token_usage: {
+              input_tokens: 80,
+              output_tokens: 20,
+              total_tokens: 100,
+            },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    for (const event of [
+      fixtureEvent({
+        event_id: "evt_run_detail_start",
+        timestamp: "2026-06-15T10:00:00Z",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        metrics: { mode: "task-description" },
+      }),
+      fixtureEvent({
+        event_id: "evt_run_detail_validation_fail",
+        timestamp: "2026-06-15T10:01:00Z",
+        event_type: "validation_attempt",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        status: "completed",
+        metrics: {
+          command_kind: "test",
+          command_label: "npm test",
+          attempt_number: 1,
+          result: "fail",
+          failure_category: "test-failure",
+        },
+      }),
+      fixtureEvent({
+        event_id: "evt_run_detail_validation_pass",
+        timestamp: "2026-06-15T10:02:00Z",
+        event_type: "validation_attempt",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        status: "completed",
+        metrics: {
+          command_kind: "test",
+          command_label: "npm test",
+          attempt_number: 2,
+          result: "pass",
+        },
+      }),
+      fixtureEvent({
+        event_id: "evt_run_detail_gate",
+        timestamp: "2026-06-15T10:03:00Z",
+        event_type: "gate_decided",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        status: "decided",
+        metrics: { gate_type: "plan-approval", decision: "approved" },
+      }),
+      fixtureEvent({
+        event_id: "evt_run_detail_review",
+        timestamp: "2026-06-15T10:04:00Z",
+        event_type: "review_pass_completed",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        status: "completed",
+        metrics: {
+          review_pass_id: "review_run_detail_01",
+          lane: "full",
+          reviewers: ["sentinel"],
+          artifact_paths: [],
+          findings_by_severity: { critical: 0, high: 1, medium: 0, low: 0 },
+          findings_by_lens: { correctness: 1, security: 0, maintainability: 0, "test-coverage": 0, simplicity: 0 },
+          blocked: false,
+          open_question_count: 1,
+        },
+      }),
+      fixtureEvent({
+        event_id: "evt_run_detail_done",
+        timestamp: "2026-06-15T10:05:00Z",
+        event_type: "skill_completed",
+        repo_path: repoPath,
+        run_id: "run_detail_01",
+        session_id: sessionId,
+        skill: "dreamers-lite",
+        status: "completed",
+        metrics: { final_status: "completed" },
+      }),
+      fixtureEvent({
+        event_id: "evt_missing_terminal_start",
+        timestamp: "2026-06-15T11:00:00Z",
+        repo_path: repoPath,
+        run_id: "run_missing_terminal",
+        skill: "dreamers-lite",
+        metrics: { mode: "task-description" },
+      }),
+    ]) {
+      await recordEvent(event, { client: "codex", home });
+    }
+    const tokenEvents = await buildHookEvents(
+      "Stop",
+      {
+        cwd: repoPath,
+        timestamp: "2026-06-15T10:05:00Z",
+        session_id: sessionId,
+        stop_hook_active: false,
+      },
+      { client: "codex", home },
+    );
+    await recordEvent(tokenEvents[1]!, { client: "codex", home });
+
+    const report = await runReport("runs", {
+      client: "codex",
+      home,
+      repo: "current",
+      cwd: repoPath,
+    });
+
+    expect(report.run_count).toBe(1);
+    expect(report.incomplete_count).toBe(1);
+    const incomplete = report.incomplete_items[0];
+    expect(incomplete).toBeDefined();
+    expect(incomplete!.reason).toBe("missing_terminal");
+    const run = report.items[0];
+    expect(run).toBeDefined();
+    if (!run) {
+      throw new Error("expected run_detail_01 in report items");
+    }
+    expect(run.run_id).toBe("run_detail_01");
+    expect(run.status).toBe("completed");
+    expect(run.duration_seconds).toBe(300);
+    expect(run.validation.attempt_count).toBe(2);
+    expect(run.validation.command_kinds.test?.retry_count).toBe(1);
+    expect(run.gates.decision_counts["plan-approval"]).toEqual({ approved: 1 });
+    expect(run.reviews.review_count).toBe(1);
+    expect(run.reviews.findings_by_severity.high).toBe(1);
+    expect(run.tokens.exact.totals.total_tokens).toBe(100);
   });
 });

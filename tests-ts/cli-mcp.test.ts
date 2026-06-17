@@ -11,15 +11,17 @@ const execFile = promisify(execFileCallback);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = join(repoRoot, "dist", "cli.js");
 const mcpServerPath = join(repoRoot, "dist", "mcp-server.js");
+const posixIt = process.platform === "win32" ? it.skip : it;
 
-async function nodeCli(args: string[], options: { input?: string; cwd?: string } = {}) {
+async function nodeCli(args: string[], options: { input?: string; cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   return runProcess(process.execPath, [cliPath, ...args], options);
 }
 
-async function runProcess(command: string, args: string[], options: { input?: string; cwd?: string } = {}) {
+async function runProcess(command: string, args: string[], options: { input?: string; cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   return new Promise<{ stdout: string; stderr: string }>((resolveProcess, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd ?? repoRoot,
+      env: options.env ? { ...process.env, ...options.env } : process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -42,6 +44,37 @@ async function runProcess(command: string, args: string[], options: { input?: st
     });
     child.stdin.end(options.input ?? "");
   });
+}
+
+async function runFirstAvailable(
+  candidates: Array<[string, string[]]>,
+  args: string[],
+  options: { input?: string; cwd?: string; env?: NodeJS.ProcessEnv } = {},
+) {
+  for (const [command, prefixArgs] of candidates) {
+    try {
+      return await runProcess(command, [...prefixArgs, ...args], options);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error(`none of these commands were available: ${candidates.map(([command]) => command).join(", ")}`);
+}
+
+function pythonCandidates(): Array<[string, string[]]> {
+  return process.platform === "win32"
+    ? [
+        ["py", ["-3"]],
+        ["python", []],
+        ["python3", []],
+      ]
+    : [
+        ["python3", []],
+        ["python", []],
+      ];
 }
 
 async function readJsonl(path: string): Promise<any[]> {
@@ -76,6 +109,23 @@ describe("Node CLI entrypoint", () => {
     });
     await access(cliPath);
     await access(mcpServerPath);
+  });
+
+  it("keeps package validation scripts aligned with the Node-first README gate", async () => {
+    const packageJson = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8"));
+    expect(packageJson.scripts).toMatchObject({
+      typecheck: "tsc --noEmit -p tsconfig.json",
+      test: "vitest run --no-file-parallelism",
+      build: "tsc -p tsconfig.build.json",
+      "test:compat": "node tests-ts/run-compat-tests.mjs",
+      validate: "npm run typecheck && npm test && npm run build && npm run test:compat",
+    });
+
+    const readme = await readFile(join(repoRoot, "README.md"), "utf8");
+    expect(readme).toContain("npm run validate");
+    expect(readme).toContain(["npm run typecheck", "npm test", "npm run build", "npm run test:compat"].join("\n"));
+    expect(readme).toContain("node tests-ts/run-compat-tests.mjs");
+    expect(readme).toContain("PowerShell:");
   });
 
   it("preserves record, doctor, checkpoint, hook, report, and dashboard command behavior", async () => {
@@ -338,6 +388,114 @@ describe("Node CLI entrypoint", () => {
       expect(failed.stdout).toBe("");
       expect(failed.stderr?.trim()).toBe("write_failed");
     }
+  });
+
+  it("infers client from env and hook payload while rejecting ambiguous homes", async () => {
+    const copilotHome = await mkdtemp(join(tmpdir(), "dreamers-cli-copilot-env-"));
+    const codexHome = await mkdtemp(join(tmpdir(), "dreamers-cli-codex-payload-"));
+    const envDoctor = await nodeCli(["doctor", "--json"], {
+      env: {
+        DREAMERS_STATS_CLIENT: "copilot",
+        COPILOT_HOME: copilotHome,
+        CODEX_HOME: "",
+      },
+    });
+    expect(JSON.parse(envDoctor.stdout).events_file).toBe(join(copilotHome, "dreamers", "stats", "events.jsonl"));
+
+    await nodeCli(
+      ["hook", "--home", codexHome, "--event-name", "UserPromptSubmit"],
+      {
+        env: {
+          DREAMERS_STATS_CLIENT: "",
+          DREAMERS_CLIENT: "",
+          COPILOT_HOME: "",
+          CODEX_HOME: "",
+        },
+        input: JSON.stringify({
+          client: "codex",
+          cwd: "/tmp/example-cli",
+          timestamp: "2026-06-15T00:03:00Z",
+          turn_id: "turn_payload_client",
+          prompt: "/test",
+        }),
+      },
+    );
+    const events = await readJsonl(join(codexHome, "dreamers", "stats", "events.jsonl"));
+    expect(events[0].event_type).toBe("prompt_submitted");
+
+    try {
+      await nodeCli(["doctor", "--json"], {
+        env: {
+          DREAMERS_STATS_CLIENT: "",
+          DREAMERS_CLIENT: "",
+          COPILOT_HOME: copilotHome,
+          CODEX_HOME: codexHome,
+        },
+      });
+      throw new Error("expected ambiguous client failure");
+    } catch (error) {
+      const failed = error as { code?: number; stdout?: string; stderr?: string };
+      expect(failed.code).toBe(2);
+      expect(failed.stdout).toBe("");
+      expect(failed.stderr?.trim()).toBe("ambiguous_client");
+    }
+  });
+
+  posixIt("executes the documented clean-home Codex install, CLI, MCP, and remove flow", async () => {
+    const smokeRoot = await mkdtemp(join(tmpdir(), "dreamers-readme-smoke-"));
+    const codexHome = join(smokeRoot, "codex-home");
+    const statsPath = join(codexHome, "dreamers", "stats", "events.jsonl");
+    await mkdir(dirname(statsPath), { recursive: true });
+    await writeFile(statsPath, '{"event_id":"historic"}\n', "utf8");
+
+    await runProcess("bash", [
+      join(repoRoot, "Install-DreamersMcpCodex.sh"),
+      "--codex-home",
+      codexHome,
+      "--dreamers-mcp-path",
+      repoRoot,
+    ]);
+    await rm(join(codexHome, "dreamers", "runtime", "dreamers_stats"), { recursive: true, force: true });
+
+    await runProcess(
+      "bash",
+      [join(codexHome, "dreamers", "scripts", "dreamers_hook.sh"), "UserPromptSubmit"],
+      {
+        env: { CODEX_HOME: codexHome },
+        input: JSON.stringify({
+          cwd: repoRoot,
+          timestamp: "2026-06-17T00:00:00Z",
+          turn_id: "turn_readme_smoke",
+          prompt: "secret smoke prompt",
+        }),
+      },
+    );
+
+    const summary = await nodeCli(["summarize", "--client", "codex", "--home", codexHome, "--repo", "all", "--json"]);
+    expect(JSON.parse(summary.stdout).report_type).toBe("summarize");
+
+    const mcp = await runFirstAvailable(
+      pythonCandidates(),
+      [join(codexHome, "dreamers", "scripts", "dreamers_mcp_server.py")],
+      {
+        env: { CODEX_HOME: codexHome },
+        input: [
+          JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+          "",
+        ].join("\n"),
+      },
+    );
+    const responses = mcp.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    expect(responses[1].result.tools.some((tool: any) => tool.name === "summarize")).toBe(true);
+
+    const rawEvents = await readFile(statsPath, "utf8");
+    expect(rawEvents).toContain('"event_id":"historic"');
+    expect(rawEvents).not.toContain("secret smoke prompt");
+
+    await runProcess("bash", [join(repoRoot, "Remove-DreamersMcpCodex.sh"), "--codex-home", codexHome]);
+    expect(await readFile(statsPath, "utf8")).toContain('"event_id":"historic"');
+    await expect(access(join(codexHome, "dreamers", "runtime", "dreamers_mcp_node"))).rejects.toThrow();
   });
 });
 

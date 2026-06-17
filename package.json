@@ -19,7 +19,9 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --no-file-parallelism",
-    "test:unit": "vitest run tests-ts/runtime.test.ts"
+    "test:unit": "vitest run tests-ts/runtime.test.ts",
+    "test:compat": "node tests-ts/run-compat-tests.mjs",
+    "validate": "npm run typecheck && npm test && npm run build && npm run test:compat"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
