@@ -13,7 +13,7 @@ import {
   statsDir,
 } from "./events.js";
 import { StatsValidationError } from "./errors.js";
-import { loadClientSessionTokenMetrics } from "./tokens.js";
+import { loadClientSessionActiveTime, loadClientSessionTokenMetrics } from "./tokens.js";
 import type { ReportCommand, ReportOptions, ReportPayloadFor, RuntimeOptions } from "./types.js";
 import { compareDesc, isDirectory, isFile, maxDate, minDate, requireReadFile, safeReaddir, sortObject } from "./utils.js";
 
@@ -458,7 +458,39 @@ function summarizeReviewEvents(reviewEvents: JsonRecord[]): JsonRecord {
   };
 }
 
-function buildRunsReport(events: JsonRecord[], warningCount: number, filters: JsonRecord): JsonRecord {
+function buildRunsReport(events: JsonRecord[], warningCount: number, filters: JsonRecord, activeDurations: Map<string, JsonRecord>): JsonRecord {
+  const { runs, eventsByRun, reliableRuns } = collectRunContext(events);
+  const summaries = reliableRuns.map(([key, run]) =>
+    buildReliableRunSummary(key, run, eventsByRun.get(key) ?? [], activeDurations.get(key) ?? unavailableActiveDuration()));
+  const items = summaries
+    .map((summary) => buildReliableRunItem(summary))
+    .sort((left, right) => compareDesc(left.last_timestamp, right.last_timestamp) || String(left.run_id).localeCompare(String(right.run_id)));
+  const groups = runGroupRows(buildReliableRunGroups(summaries));
+  const incompleteItems = [...runs.values()]
+    .map((run) => ({ run, reason: runReliabilityReason(run) }))
+    .filter((item) => item.reason !== null)
+    .map((item) => buildIncompleteRunItem(item.run, item.reason as string))
+    .sort((left, right) => compareDesc(left.last_timestamp, right.last_timestamp) || String(left.run_id).localeCompare(String(right.run_id)));
+
+  return {
+    report_type: "runs",
+    warning_count: warningCount,
+    filters: reportFiltersPublic(filters),
+    run_count: items.length,
+    incomplete_count: incompleteItems.length,
+    range: runRange(reliableRuns.map(([, run]) => run)),
+    groups,
+    items,
+    incomplete_items: incompleteItems,
+  };
+}
+
+function collectRunContext(events: JsonRecord[]): {
+  runs: Map<string, JsonRecord>;
+  eventsByRun: Map<string, JsonRecord[]>;
+  reliableKeys: Set<string>;
+  reliableRuns: Array<[string, JsonRecord]>;
+} {
   const runs = new Map<string, JsonRecord>();
   const eventsByRun = new Map<string, JsonRecord[]>();
   for (const event of events) {
@@ -514,27 +546,16 @@ function buildRunsReport(events: JsonRecord[], warningCount: number, filters: Js
   }
 
   const reliableRuns = [...runs.entries()].filter(([key]) => reliableKeys.has(key));
-  const groups = runGroupRows(buildReliableRunGroups(reliableRuns.map(([, run]) => run)));
-  const items = reliableRuns
-    .map(([key, run]) => buildReliableRunItem(run, eventsByRun.get(key) ?? []))
-    .sort((left, right) => compareDesc(left.last_timestamp, right.last_timestamp) || String(left.run_id).localeCompare(String(right.run_id)));
-  const incompleteItems = [...runs.values()]
-    .map((run) => ({ run, reason: runReliabilityReason(run) }))
-    .filter((item) => item.reason !== null)
-    .map((item) => buildIncompleteRunItem(item.run, item.reason as string))
-    .sort((left, right) => compareDesc(left.last_timestamp, right.last_timestamp) || String(left.run_id).localeCompare(String(right.run_id)));
+  return { runs, eventsByRun, reliableKeys, reliableRuns };
+}
 
-  return {
-    report_type: "runs",
-    warning_count: warningCount,
-    filters: reportFiltersPublic(filters),
-    run_count: items.length,
-    incomplete_count: incompleteItems.length,
-    range: runRange(reliableRuns.map(([, run]) => run)),
-    groups,
-    items,
-    incomplete_items: incompleteItems,
-  };
+async function resolveReportActiveDurations(events: JsonRecord[], options: RuntimeOptions): Promise<Map<string, JsonRecord>> {
+  const activeDurations = new Map<string, JsonRecord>();
+  const { eventsByRun, reliableRuns } = collectRunContext(events);
+  await Promise.all(reliableRuns.map(async ([key, run]) => {
+    activeDurations.set(key, await resolveRunActiveDuration(run, eventsByRun.get(key) ?? [], options));
+  }));
+  return activeDurations;
 }
 
 function runReliabilityReason(run: JsonRecord): string | null {
@@ -579,26 +600,92 @@ function runDurationSeconds(startTimestamp: Date | null, endTimestamp: Date | nu
   return Math.max(Math.floor((endTimestamp.getTime() - startTimestamp.getTime()) / 1000), 0);
 }
 
-function buildReliableRunGroups(runs: JsonRecord[]): Map<string, JsonRecord> {
+async function resolveRunActiveDuration(run: JsonRecord, runEvents: JsonRecord[], options: RuntimeOptions): Promise<JsonRecord> {
+  const startTimestamp = runStartTimestamp(run);
+  const endTimestamp = runEndTimestamp(run);
+  const startIso = datetimeToIso(startTimestamp);
+  const endIso = datetimeToIso(endTimestamp);
+  if (!startIso || !endIso) {
+    return unavailableActiveDuration();
+  }
+  if (!options.client || !options.home) {
+    return unavailableActiveDuration();
+  }
+  if (options.client !== "codex") {
+    return unavailableActiveDuration();
+  }
+  const sessionIds = [...new Set(
+    runEvents
+      .map((event) => event.session_id)
+      .filter((sessionId): sessionId is string => typeof sessionId === "string" && Boolean(sessionId)),
+  )];
+  if (!sessionIds.length) {
+    return unavailableActiveDuration();
+  }
+  if (sessionIds.length > 1) {
+    return unavailableActiveDuration();
+  }
+  const activeTime = await loadClientSessionActiveTime(options.client, options.home, sessionIds[0], startIso, endIso);
+  if (!activeTime) {
+    return unavailableActiveDuration();
+  }
+  return activeTime;
+}
+
+function unavailableActiveDuration(): JsonRecord {
+  return {
+    active_duration_seconds: null,
+    active_turn_count: 0,
+    active_duration_quality: "unavailable",
+    active_duration_source: null,
+  };
+}
+
+function buildReliableRunSummary(key: string, run: JsonRecord, runEvents: JsonRecord[], activeDuration: JsonRecord): JsonRecord {
+  const startTimestamp = runStartTimestamp(run);
+  const endTimestamp = runEndTimestamp(run);
+  return {
+    key,
+    run,
+    runEvents,
+    run_id: run.run_id,
+    repo_path: run.repo_path,
+    skill: run.skill,
+    status: runStatusFromTerminal(run),
+    duration_seconds: runDurationSeconds(startTimestamp, endTimestamp),
+    activeDuration,
+    first_timestamp: run.first_timestamp,
+    last_timestamp: run.last_timestamp,
+    start_timestamp: startTimestamp,
+    end_timestamp: endTimestamp,
+  };
+}
+
+function buildReliableRunGroups(summaries: JsonRecord[]): Map<string, JsonRecord> {
   const groups = new Map<string, JsonRecord>();
-  for (const run of runs) {
-    const startTimestamp = runStartTimestamp(run);
-    const endTimestamp = runEndTimestamp(run);
+  for (const summary of summaries) {
+    const startTimestamp = summary.start_timestamp;
+    const endTimestamp = summary.end_timestamp;
     if (!startTimestamp || !endTimestamp) {
       continue;
     }
-    const status = runStatusFromTerminal(run);
-    const key = `${run.skill}\u0000${status}`;
+    const key = `${summary.skill}\u0000${summary.status}`;
     const group = groups.get(key) ?? {
-      skill: run.skill,
-      status,
+      skill: summary.skill,
+      status: summary.status,
       run_count: 0,
       total_duration_seconds: 0,
+      active_run_count: 0,
+      total_active_duration_seconds: 0,
       first_timestamp: startTimestamp,
       last_timestamp: endTimestamp,
     };
     group.run_count += 1;
-    group.total_duration_seconds += runDurationSeconds(startTimestamp, endTimestamp);
+    group.total_duration_seconds += Number(summary.duration_seconds ?? 0);
+    if (typeof summary.activeDuration.active_duration_seconds === "number") {
+      group.active_run_count += 1;
+      group.total_active_duration_seconds += summary.activeDuration.active_duration_seconds;
+    }
     group.first_timestamp = minDate(group.first_timestamp, startTimestamp);
     group.last_timestamp = maxDate(group.last_timestamp, endTimestamp);
     groups.set(key, group);
@@ -613,29 +700,31 @@ function runGroupRows(groups: Map<string, JsonRecord>): JsonRecord[] {
     run_count: group.run_count,
     total_duration_seconds: group.total_duration_seconds,
     average_duration_seconds: group.run_count ? Math.floor(group.total_duration_seconds / group.run_count) : 0,
+    active_run_count: group.active_run_count,
+    total_active_duration_seconds: group.active_run_count ? group.total_active_duration_seconds : null,
+    average_active_duration_seconds: group.active_run_count ? Math.floor(group.total_active_duration_seconds / group.active_run_count) : null,
     first_timestamp: datetimeToIso(group.first_timestamp),
     last_timestamp: datetimeToIso(group.last_timestamp),
   }));
 }
 
-function buildReliableRunItem(run: JsonRecord, runEvents: JsonRecord[]): JsonRecord {
-  const startTimestamp = runStartTimestamp(run);
-  const endTimestamp = runEndTimestamp(run);
+function buildReliableRunItem(summary: JsonRecord): JsonRecord {
   return {
-    run_id: run.run_id,
-    repo_path: run.repo_path,
-    skill: run.skill,
-    status: runStatusFromTerminal(run),
+    run_id: summary.run_id,
+    repo_path: summary.repo_path,
+    skill: summary.skill,
+    status: summary.status,
     data_quality: "confirmed_closed",
-    duration_seconds: runDurationSeconds(startTimestamp, endTimestamp),
-    first_timestamp: datetimeToIso(run.first_timestamp),
-    last_timestamp: datetimeToIso(run.last_timestamp),
-    start_timestamp: datetimeToIso(startTimestamp),
-    end_timestamp: datetimeToIso(endTimestamp),
-    validation: summarizeValidationEvents(runEvents.filter((event) => event.event_type === "validation_attempt")),
-    gates: summarizeGateEvents(runEvents.filter((event) => event.event_type === "gate_decided")),
-    reviews: summarizeReviewEvents(runEvents.filter((event) => event.event_type === "review_pass_completed")),
-    tokens: summarizeTokenEvents(runEvents.filter((event) => event.event_type === "token_usage_recorded")),
+    duration_seconds: summary.duration_seconds,
+    ...summary.activeDuration,
+    first_timestamp: datetimeToIso(summary.first_timestamp),
+    last_timestamp: datetimeToIso(summary.last_timestamp),
+    start_timestamp: datetimeToIso(summary.start_timestamp),
+    end_timestamp: datetimeToIso(summary.end_timestamp),
+    validation: summarizeValidationEvents(summary.runEvents.filter((event: JsonRecord) => event.event_type === "validation_attempt")),
+    gates: summarizeGateEvents(summary.runEvents.filter((event: JsonRecord) => event.event_type === "gate_decided")),
+    reviews: summarizeReviewEvents(summary.runEvents.filter((event: JsonRecord) => event.event_type === "review_pass_completed")),
+    tokens: summarizeTokenEvents(summary.runEvents.filter((event: JsonRecord) => event.event_type === "token_usage_recorded")),
   };
 }
 
@@ -1007,12 +1096,12 @@ function buildWorkflowReport(events: JsonRecord[]): JsonRecord {
   };
 }
 
-function buildSummaryReport(events: JsonRecord[], warningCount: number, filters: JsonRecord): JsonRecord {
+function buildSummaryReport(events: JsonRecord[], warningCount: number, filters: JsonRecord, activeDurations: Map<string, JsonRecord>): JsonRecord {
   const report: JsonRecord = {
     report_type: "summarize",
     warning_count: warningCount,
     filters: reportFiltersPublic(filters),
-    runs: buildRunsReport(events, warningCount, filters),
+    runs: buildRunsReport(events, warningCount, filters, activeDurations),
     reviews: buildReviewsReport(events, warningCount, filters),
     validation: buildValidationReport(events, warningCount, filters),
     gates: buildGatesReport(events, warningCount, filters),
@@ -1034,7 +1123,7 @@ function reportFiltersPublic(filters: JsonRecord): JsonRecord {
   };
 }
 
-const REPORT_BUILDERS: Record<ReportCommand, (events: JsonRecord[], warningCount: number, filters: JsonRecord) => JsonRecord> = {
+const REPORT_BUILDERS: Record<ReportCommand, (events: JsonRecord[], warningCount: number, filters: JsonRecord, activeDurations: Map<string, JsonRecord>) => JsonRecord> = {
   runs: buildRunsReport,
   reviews: buildReviewsReport,
   validation: buildValidationReport,
@@ -1051,5 +1140,8 @@ export async function runReport<Command extends ReportCommand>(
   const resolvedEvents = await resolveReportTokenEvents(events, options);
   const filters = buildReportFilters(options);
   const filtered = filterReportEvents(resolvedEvents, filters);
-  return REPORT_BUILDERS[command](filtered, warningCount, filters) as ReportPayloadFor<Command>;
+  const activeDurations = command === "runs" || command === "summarize"
+    ? await resolveReportActiveDurations(filtered, options)
+    : new Map<string, JsonRecord>();
+  return REPORT_BUILDERS[command](filtered, warningCount, filters, activeDurations) as ReportPayloadFor<Command>;
 }

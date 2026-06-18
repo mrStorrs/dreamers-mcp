@@ -132,6 +132,37 @@ describe("Node CLI entrypoint", () => {
     const home = await mkdtemp(join(tmpdir(), "dreamers-cli-"));
     const repo = join(home, "repo");
     await mkdir(join(repo, ".git"), { recursive: true });
+    const sessionId = "session_cli_active";
+    const sessionPath = join(
+      home,
+      "sessions",
+      "2026",
+      "06",
+      "15",
+      `rollout-2026-06-15T00-00-00-${sessionId}.jsonl`,
+    );
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({ timestamp: "2026-06-15T00:00:10Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({
+          timestamp: "2026-06-15T00:00:11Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "SECRET_CLI_PROMPT" },
+        }),
+        JSON.stringify({ timestamp: "2026-06-15T00:01:00Z", type: "event_msg", payload: { type: "task_complete" } }),
+        JSON.stringify({ timestamp: "2026-06-15T00:04:00Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({
+          timestamp: "2026-06-15T00:04:10Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "SECRET_CLI_ASSISTANT" },
+        }),
+        JSON.stringify({ timestamp: "2026-06-15T00:04:20Z", type: "event_msg", payload: { type: "task_complete" } }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
 
     const record = await nodeCli([
       "record",
@@ -140,7 +171,7 @@ describe("Node CLI entrypoint", () => {
       "--home",
       home,
       "--event-json",
-      JSON.stringify({ ...baseEvent, repo_path: repo }),
+      JSON.stringify({ ...baseEvent, repo_path: repo, session_id: sessionId }),
       "--print-event-id",
     ]);
     expect(record.stderr).toBe("");
@@ -159,6 +190,7 @@ describe("Node CLI entrypoint", () => {
         timestamp: "2026-06-15T00:05:00Z",
         event_type: "skill_completed",
         repo_path: repo,
+        session_id: sessionId,
         status: "completed",
         metrics: { final_status: "completed" },
       }),
@@ -282,6 +314,24 @@ describe("Node CLI entrypoint", () => {
       const report = await nodeCli([command, "--client", "codex", "--home", home, "--repo", "all", "--json"]);
       expect(JSON.parse(report.stdout).report_type).toBe(command);
     }
+    const runsJson = await nodeCli(["runs", "--client", "codex", "--home", home, "--repo", "all", "--json"]);
+    const runsPayload = JSON.parse(runsJson.stdout);
+    expect(runsPayload.items[0].duration_seconds).toBe(300);
+    expect(runsPayload.items[0].active_duration_seconds).toBe(70);
+    expect(runsPayload.items[0].active_duration_quality).toBe("observed");
+    expect(runsPayload.items[0].active_duration_source).toBe("codex_session_tasks");
+    expect(runsPayload.groups[0].average_active_duration_seconds).toBe(70);
+    expect(runsJson.stdout).not.toContain("SECRET_CLI_PROMPT");
+    expect(runsJson.stdout).not.toContain("SECRET_CLI_ASSISTANT");
+
+    const runsText = await nodeCli(["runs", "--client", "codex", "--home", home, "--repo", "all"]);
+    expect(runsText.stdout).toContain("active=1m10s");
+    expect(runsText.stdout).toContain("wall=5m0s");
+
+    const summaryText = await nodeCli(["summarize", "--client", "codex", "--home", home, "--repo", "all"]);
+    expect(summaryText.stdout).toContain("active 1m10s");
+    expect(summaryText.stdout).toContain("wall 5m0s");
+
     const copilotSummary = await nodeCli(["summarize", "--client", "copilot", "--home", home, "--repo", "all", "--json"]);
     expect(JSON.parse(copilotSummary.stdout).workflow_outputs).toMatchObject({
       cycle_status_counts: { completed: 1 },
@@ -305,6 +355,10 @@ describe("Node CLI entrypoint", () => {
     ]);
     expect(dashboard.stdout).toContain("<html");
     expect(dashboard.stdout).toContain("Generated: Jun 15, 2026 00:10 UTC");
+    expect(dashboard.stdout).toContain("Active time");
+    expect(dashboard.stdout).toContain("Avg active");
+    expect(dashboard.stdout).toContain("1m10s");
+    expect(dashboard.stdout).not.toContain("SECRET_CLI_PROMPT");
 
     const outputPath = join(home, "dashboard.html");
     await nodeCli(["dashboard", "--client", "codex", "--home", home, "--repo", "all", "--output", outputPath]);
@@ -506,6 +560,27 @@ describe("Node MCP server entrypoint", () => {
 
   it("serves JSON-RPC initialize, ping, tools/list, tools/call, and tool errors over stdio", async () => {
     const home = await mkdtemp(join(tmpdir(), "dreamers-mcp-"));
+    const sessionId = "session_mcp_active";
+    const sessionPath = join(
+      home,
+      "sessions",
+      "2026",
+      "06",
+      "15",
+      `rollout-2026-06-15T00-00-00-${sessionId}.jsonl`,
+    );
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({ timestamp: "2026-06-15T00:00:10Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({ timestamp: "2026-06-15T00:01:00Z", type: "event_msg", payload: { type: "task_complete" } }),
+        JSON.stringify({ timestamp: "2026-06-15T00:04:00Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({ timestamp: "2026-06-15T00:04:20Z", type: "event_msg", payload: { type: "task_complete" } }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     const messages = [
       { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
       { jsonrpc: "2.0", id: 2, method: "ping", params: {} },
@@ -519,13 +594,34 @@ describe("Node MCP server entrypoint", () => {
           arguments: {
             client: "codex",
             home,
-            event: { ...baseEvent, event_id: "evt_mcp_start" },
+            event: { ...baseEvent, event_id: "evt_mcp_start", session_id: sessionId },
           },
         },
       },
       {
         jsonrpc: "2.0",
         id: 5,
+        method: "tools/call",
+        params: {
+          name: "record_event",
+          arguments: {
+            client: "codex",
+            home,
+            event: {
+              ...baseEvent,
+              event_id: "evt_mcp_complete",
+              timestamp: "2026-06-15T00:05:00Z",
+              event_type: "skill_completed",
+              status: "completed",
+              session_id: sessionId,
+              metrics: { final_status: "completed" },
+            },
+          },
+        },
+      },
+      {
+        jsonrpc: "2.0",
+        id: 6,
         method: "tools/call",
         params: {
           name: "record_checkpoint",
@@ -547,7 +643,7 @@ describe("Node MCP server entrypoint", () => {
       },
       {
         jsonrpc: "2.0",
-        id: 6,
+        id: 7,
         method: "tools/call",
         params: {
           name: "record_hook",
@@ -566,7 +662,7 @@ describe("Node MCP server entrypoint", () => {
       },
       {
         jsonrpc: "2.0",
-        id: 7,
+        id: 8,
         method: "tools/call",
         params: {
           name: "runs",
@@ -575,7 +671,7 @@ describe("Node MCP server entrypoint", () => {
       },
       {
         jsonrpc: "2.0",
-        id: 8,
+        id: 9,
         method: "tools/call",
         params: {
           name: "not_a_tool",
@@ -616,12 +712,16 @@ describe("Node MCP server entrypoint", () => {
       structuredContent: { event_id: "evt_mcp_start" },
       isError: false,
     });
-    expect(responses[4].result.structuredContent.event_id).toMatch(/^skill_validation_attempt_/);
-    expect(responses[5].result.structuredContent.event_ids).toHaveLength(1);
-    expect(responses[6].result.structuredContent.report_type).toBe("runs");
-    expect(responses[6].result.content[0].type).toBe("text");
-    expect(JSON.parse(responses[6].result.content[0].text).report_type).toBe("runs");
-    expect(responses[7].result).toMatchObject({ resultType: "complete", isError: true });
-    expect(responses[7].result.content[0].text).toContain("tool is not supported");
+    expect(responses[4].result.structuredContent.event_id).toBe("evt_mcp_complete");
+    expect(responses[5].result.structuredContent.event_id).toMatch(/^skill_validation_attempt_/);
+    expect(responses[6].result.structuredContent.event_ids).toHaveLength(1);
+    expect(responses[7].result.structuredContent.report_type).toBe("runs");
+    expect(responses[7].result.structuredContent.items[0].active_duration_seconds).toBe(70);
+    expect(responses[7].result.structuredContent.groups[0].average_active_duration_seconds).toBe(70);
+    expect(responses[7].result.content[0].type).toBe("text");
+    expect(JSON.parse(responses[7].result.content[0].text).report_type).toBe("runs");
+    expect(JSON.parse(responses[7].result.content[0].text).items[0].active_duration_seconds).toBe(70);
+    expect(responses[8].result).toMatchObject({ resultType: "complete", isError: true });
+    expect(responses[8].result.content[0].text).toContain("tool is not supported");
   });
 });

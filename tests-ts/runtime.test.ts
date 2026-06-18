@@ -136,6 +136,14 @@ async function recordFixtureEvent(home: string, overrides: Partial<StatsEventInp
   return recordEvent(fixtureEvent(overrides), { client: "codex", home });
 }
 
+async function writeCodexSessionRows(home: string, sessionId: string, rolloutTimestamp: string, rows: string[]) {
+  const [datePart] = rolloutTimestamp.split("T");
+  const [year, month, day] = datePart!.split("-");
+  const sessionPath = join(home, "sessions", year!, month!, day!, `rollout-${rolloutTimestamp}-${sessionId}.jsonl`);
+  await mkdir(dirname(sessionPath), { recursive: true });
+  await writeFile(sessionPath, `${rows.join("\n")}\n`, "utf8");
+}
+
 describe("published TypeScript package", () => {
   it("builds loadable dist entrypoints without importing Python runtime code", async () => {
     await rm(join(repoRoot, "dist"), { recursive: true, force: true });
@@ -508,6 +516,395 @@ describe("hook event conversion and token harvesting", () => {
 });
 
 describe("report builders and dashboard rendering", () => {
+  it("derives active AI time from Codex task spans without exposing session content", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-active-time-"));
+    const repoPath = await makeTempRepo(home, "repo");
+    const sessionId = "session_active_time";
+    const sessionPath = join(
+      home,
+      "sessions",
+      "2026",
+      "06",
+      "15",
+      `rollout-2026-06-15T10-00-00-${sessionId}.jsonl`,
+    );
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({ timestamp: "2026-06-15T10:00:05Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({
+          timestamp: "2026-06-15T10:00:06Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "SECRET_ACTIVE_PROMPT" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-06-15T10:00:55Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "SECRET_ACTIVE_ASSISTANT" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-06-15T10:01:05Z",
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { last_token_usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20 } },
+          },
+        }),
+        JSON.stringify({ timestamp: "2026-06-15T10:01:05Z", type: "event_msg", payload: { type: "task_complete" } }),
+        "malformed SECRET_ACTIVE_TOOL_OUTPUT",
+        JSON.stringify({ timestamp: "2026-06-15T10:04:00Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({ timestamp: "2026-06-15T10:04:30Z", type: "event_msg", payload: { type: "task_complete" } }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await recordFixtureEvent(home, {
+      event_id: "evt_active_start",
+      timestamp: "2026-06-15T10:00:00Z",
+      repo_path: repoPath,
+      run_id: "run_active",
+      session_id: sessionId,
+      skill: "dreamers-full",
+      metrics: { mode: "task-description" },
+    });
+    await recordFixtureEvent(home, {
+      event_id: "evt_active_done",
+      timestamp: "2026-06-15T10:05:00Z",
+      event_type: "skill_completed",
+      repo_path: repoPath,
+      run_id: "run_active",
+      session_id: sessionId,
+      skill: "dreamers-full",
+      status: "completed",
+      metrics: { final_status: "completed" },
+    });
+
+    const report = await runReport("runs", {
+      client: "codex",
+      home,
+      repo: "current",
+      cwd: repoPath,
+    });
+
+    expect(report.run_count).toBe(1);
+    const run = report.items[0] as any;
+    expect(run.duration_seconds).toBe(300);
+    expect(run.active_duration_seconds).toBe(90);
+    expect(run.active_turn_count).toBe(2);
+    expect(run.active_duration_quality).toBe("observed");
+    expect(run.active_duration_source).toBe("codex_session_tasks");
+    expect(run.active_duration_unavailable_reason).toBeUndefined();
+
+    const group = report.groups[0] as any;
+    expect(group.total_duration_seconds).toBe(300);
+    expect(group.average_duration_seconds).toBe(300);
+    expect(group.active_run_count).toBe(1);
+    expect(group.total_active_duration_seconds).toBe(90);
+    expect(group.average_active_duration_seconds).toBe(90);
+
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("SECRET_ACTIVE_PROMPT");
+    expect(serialized).not.toContain("SECRET_ACTIVE_ASSISTANT");
+    expect(serialized).not.toContain("SECRET_ACTIVE_TOOL_OUTPUT");
+  });
+
+  it("marks active AI time unavailable for ambiguous session logs while preserving run summaries", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-active-time-missing-"));
+    const repoPath = await makeTempRepo(home, "repo");
+    const sessionId = "session_ambiguous_active_time";
+    const sessionPath = join(
+      home,
+      "sessions",
+      "2026",
+      "06",
+      "15",
+      `rollout-2026-06-15T11-00-00-${sessionId}.jsonl`,
+    );
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({ timestamp: "2026-06-15T11:00:10Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({ timestamp: "2026-06-15T11:00:20Z", type: "event_msg", payload: { type: "task_started" } }),
+        JSON.stringify({ timestamp: "2026-06-15T11:00:30Z", type: "event_msg", payload: { type: "task_complete" } }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    for (const event of [
+      fixtureEvent({
+        event_id: "evt_ambiguous_start",
+        timestamp: "2026-06-15T11:00:00Z",
+        repo_path: repoPath,
+        run_id: "run_ambiguous_active",
+        session_id: sessionId,
+        skill: "dreamers-full",
+        metrics: { mode: "task-description" },
+      }),
+      fixtureEvent({
+        event_id: "evt_ambiguous_validation",
+        timestamp: "2026-06-15T11:01:00Z",
+        event_type: "validation_attempt",
+        repo_path: repoPath,
+        run_id: "run_ambiguous_active",
+        session_id: sessionId,
+        skill: "dreamers-full",
+        status: "completed",
+        metrics: { command_kind: "test", command_label: "npm test", attempt_number: 1, result: "pass" },
+      }),
+      fixtureEvent({
+        event_id: "evt_ambiguous_gate",
+        timestamp: "2026-06-15T11:02:00Z",
+        event_type: "gate_decided",
+        repo_path: repoPath,
+        run_id: "run_ambiguous_active",
+        session_id: sessionId,
+        skill: "dreamers-full",
+        status: "decided",
+        metrics: { gate_type: "implementation-start", decision: "approved_start_implementation" },
+      }),
+      fixtureEvent({
+        event_id: "evt_ambiguous_token",
+        timestamp: "2026-06-15T11:03:00Z",
+        event_type: "token_usage_recorded",
+        repo_path: repoPath,
+        run_id: "run_ambiguous_active",
+        session_id: sessionId,
+        skill: "dreamers-full",
+        source: "summary",
+        status: "completed",
+        metrics: { token_source: "unavailable", attribution_scope: "turn" },
+      }),
+      fixtureEvent({
+        event_id: "evt_ambiguous_done",
+        timestamp: "2026-06-15T11:05:00Z",
+        event_type: "skill_completed",
+        repo_path: repoPath,
+        run_id: "run_ambiguous_active",
+        session_id: sessionId,
+        skill: "dreamers-full",
+        status: "completed",
+        metrics: { final_status: "completed" },
+      }),
+    ]) {
+      await recordEvent(event, { client: "codex", home });
+    }
+
+    const report = await runReport("runs", { client: "codex", home, repo: "current", cwd: repoPath });
+    const run = report.items[0] as any;
+    expect(run.duration_seconds).toBe(300);
+    expect(run.active_duration_seconds).toBeNull();
+    expect(run.active_turn_count).toBe(0);
+    expect(run.active_duration_quality).toBe("unavailable");
+    expect(run.active_duration_source).toBeNull();
+    expect(run.active_duration_unavailable_reason).toBeUndefined();
+    expect(run.validation.attempt_count).toBe(1);
+    expect(run.gates.decision_counts["implementation-start"]).toEqual({ approved_start_implementation: 1 });
+    expect(run.tokens.unavailable.row_count).toBe(1);
+
+    const group = report.groups[0] as any;
+    expect(group.total_duration_seconds).toBe(300);
+    expect(group.active_run_count).toBe(0);
+    expect(group.total_active_duration_seconds).toBeNull();
+    expect(group.average_active_duration_seconds).toBeNull();
+  });
+
+  it("marks active AI time unavailable for missing and unpairable session spans", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-active-time-unpairable-"));
+    const repoPath = await makeTempRepo(home, "repo");
+    const cases = [
+      { slug: "missing", hour: 12, rows: null },
+      {
+        slug: "orphan_complete",
+        hour: 13,
+        rows: [
+          JSON.stringify({ timestamp: "2026-06-15T13:00:10Z", type: "event_msg", payload: { type: "task_complete" } }),
+        ],
+      },
+      {
+        slug: "trailing_start",
+        hour: 14,
+        rows: [
+          JSON.stringify({ timestamp: "2026-06-15T14:00:10Z", type: "event_msg", payload: { type: "task_started" } }),
+        ],
+      },
+      {
+        slug: "out_of_order",
+        hour: 15,
+        rows: [
+          JSON.stringify({ timestamp: "2026-06-15T15:00:20Z", type: "event_msg", payload: { type: "task_started" } }),
+          JSON.stringify({ timestamp: "2026-06-15T15:00:10Z", type: "event_msg", payload: { type: "task_complete" } }),
+        ],
+      },
+      {
+        slug: "crosses_start",
+        hour: 16,
+        rows: [
+          JSON.stringify({ timestamp: "2026-06-15T15:59:50Z", type: "event_msg", payload: { type: "task_started" } }),
+          JSON.stringify({ timestamp: "2026-06-15T16:00:30Z", type: "event_msg", payload: { type: "task_complete" } }),
+        ],
+      },
+      {
+        slug: "crosses_end",
+        hour: 17,
+        rows: [
+          JSON.stringify({ timestamp: "2026-06-15T17:04:50Z", type: "event_msg", payload: { type: "task_started" } }),
+          JSON.stringify({ timestamp: "2026-06-15T17:05:10Z", type: "event_msg", payload: { type: "task_complete" } }),
+        ],
+      },
+    ];
+
+    for (const entry of cases) {
+      const hour = String(entry.hour).padStart(2, "0");
+      const sessionId = `session_${entry.slug}`;
+      const runId = `run_${entry.slug}`;
+      if (entry.rows) {
+        await writeCodexSessionRows(home, sessionId, `2026-06-15T${hour}-00-00`, entry.rows);
+      }
+      for (const event of [
+        fixtureEvent({
+          event_id: `evt_${entry.slug}_start`,
+          timestamp: `2026-06-15T${hour}:00:00Z`,
+          repo_path: repoPath,
+          run_id: runId,
+          session_id: sessionId,
+          skill: "dreamers-full",
+          metrics: { mode: "task-description" },
+        }),
+        fixtureEvent({
+          event_id: `evt_${entry.slug}_validation`,
+          timestamp: `2026-06-15T${hour}:01:00Z`,
+          event_type: "validation_attempt",
+          repo_path: repoPath,
+          run_id: runId,
+          session_id: sessionId,
+          skill: "dreamers-full",
+          status: "completed",
+          metrics: { command_kind: "test", command_label: "npm test", attempt_number: 1, result: "pass" },
+        }),
+        fixtureEvent({
+          event_id: `evt_${entry.slug}_gate`,
+          timestamp: `2026-06-15T${hour}:02:00Z`,
+          event_type: "gate_decided",
+          repo_path: repoPath,
+          run_id: runId,
+          session_id: sessionId,
+          skill: "dreamers-full",
+          status: "decided",
+          metrics: { gate_type: "implementation-start", decision: "approved_start_implementation" },
+        }),
+        fixtureEvent({
+          event_id: `evt_${entry.slug}_token`,
+          timestamp: `2026-06-15T${hour}:03:00Z`,
+          event_type: "token_usage_recorded",
+          repo_path: repoPath,
+          run_id: runId,
+          session_id: sessionId,
+          skill: "dreamers-full",
+          source: "summary",
+          status: "completed",
+          metrics: { token_source: "unavailable", attribution_scope: "turn" },
+        }),
+        fixtureEvent({
+          event_id: `evt_${entry.slug}_done`,
+          timestamp: `2026-06-15T${hour}:05:00Z`,
+          event_type: "skill_completed",
+          repo_path: repoPath,
+          run_id: runId,
+          session_id: sessionId,
+          skill: "dreamers-full",
+          status: "completed",
+          metrics: { final_status: "completed" },
+        }),
+      ]) {
+        await recordEvent(event, { client: "codex", home });
+      }
+    }
+
+    const report = await runReport("runs", { client: "codex", home, repo: "current", cwd: repoPath });
+    expect(report.run_count).toBe(cases.length);
+    for (const entry of cases) {
+      const run = report.items.find((item) => item.run_id === `run_${entry.slug}`) as any;
+      expect(run.duration_seconds).toBe(300);
+      expect(run.active_duration_seconds).toBeNull();
+      expect(run.active_turn_count).toBe(0);
+      expect(run.active_duration_quality).toBe("unavailable");
+      expect(run.active_duration_source).toBeNull();
+      expect(run.validation.attempt_count).toBe(1);
+      expect(run.gates.decision_counts["implementation-start"]).toEqual({ approved_start_implementation: 1 });
+      expect(run.tokens.unavailable.row_count).toBe(1);
+    }
+  });
+
+  it("aggregates active AI time across mixed-availability runs in one group", async () => {
+    const home = await mkdtemp(join(tmpdir(), "dreamers-ts-active-time-group-"));
+    const repoPath = await makeTempRepo(home, "repo");
+    const runs = [
+      { runId: "run_group_a", sessionId: "session_group_a", minute: "00", activeStart: "00:10", activeEnd: "01:10" },
+      { runId: "run_group_b", sessionId: "session_group_b", minute: "10", activeStart: "10:30", activeEnd: "11:00" },
+      { runId: "run_group_c", sessionId: "session_group_c", minute: "20", activeStart: null, activeEnd: null },
+    ];
+
+    for (const run of runs) {
+      if (run.activeStart && run.activeEnd) {
+        await writeCodexSessionRows(home, run.sessionId, `2026-06-15T10-${run.minute}-00`, [
+          JSON.stringify({ timestamp: `2026-06-15T10:${run.activeStart}Z`, type: "event_msg", payload: { type: "task_started" } }),
+          JSON.stringify({ timestamp: `2026-06-15T10:${run.activeEnd}Z`, type: "event_msg", payload: { type: "task_complete" } }),
+        ]);
+      }
+      for (const event of [
+        fixtureEvent({
+          event_id: `evt_${run.runId}_start`,
+          timestamp: `2026-06-15T10:${run.minute}:00Z`,
+          repo_path: repoPath,
+          run_id: run.runId,
+          session_id: run.sessionId,
+          skill: "dreamers-full",
+          metrics: { mode: "task-description" },
+        }),
+        fixtureEvent({
+          event_id: `evt_${run.runId}_done`,
+          timestamp: `2026-06-15T10:${String(Number(run.minute) + 5).padStart(2, "0")}:00Z`,
+          event_type: "skill_completed",
+          repo_path: repoPath,
+          run_id: run.runId,
+          session_id: run.sessionId,
+          skill: "dreamers-full",
+          status: "completed",
+          metrics: { final_status: "completed" },
+        }),
+      ]) {
+        await recordEvent(event, { client: "codex", home });
+      }
+    }
+
+    const report = await runReport("runs", { client: "codex", home, repo: "current", cwd: repoPath });
+    const group = report.groups[0] as any;
+    expect(group.run_count).toBe(3);
+    expect(group.total_duration_seconds).toBe(900);
+    expect(group.average_duration_seconds).toBe(300);
+    expect(group.active_run_count).toBe(2);
+    expect(group.total_active_duration_seconds).toBe(90);
+    expect(group.average_active_duration_seconds).toBe(45);
+  });
+
+  it("keeps active AI time as a report-only derivation without new bookend events", async () => {
+    const tracked = await execFile("git", ["ls-files"], { cwd: repoRoot });
+    const files = tracked.stdout
+      .split(/\r?\n/)
+      .filter((file) => file && !file.startsWith(".dreamers/") && /\.(?:ts|js|mjs|py|sh|md|json)$/.test(file));
+    const joined = (await Promise.all(files.map((file) => readFile(join(repoRoot, file), "utf8")))).join("\n");
+    expect(joined).not.toMatch(/\bactive_(?:time|ai)_(?:started|completed|recorded)\b/);
+    expect(joined).not.toMatch(/\bai_work_(?:started|completed|recorded)\b/);
+    expect(joined).not.toMatch(/\bmodel_work_(?:started|completed|recorded)\b/);
+
+    const eventSchema = await readFile(join(repoRoot, "src", "events.ts"), "utf8");
+    expect(eventSchema).not.toMatch(/required_fields:[\s\S]{0,160}active_/);
+  });
+
   it("resolves unavailable Codex token rows from session logs when report home uses tilde", async () => {
     const realHome = await mkdtemp(join(homedir(), ".dreamers-ts-codex-home-"));
     const tildeHome = `~/${basename(realHome)}`;
