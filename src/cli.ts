@@ -356,7 +356,9 @@ function formatReport(command: ReportCommand, report: ReportPayload): string {
 function formatRunsReport(report: JsonRecord): string {
   const lines = ["Dreamers runs report", formatFilterHeader(report.filters), ...formatWarningLines(report.warning_count), `Runs: ${report.run_count}`];
   for (const group of (report.groups ?? []).slice(0, 8)) {
-    lines.push(`- ${group.skill} [${group.status}] runs=${group.run_count} avg=${formatDuration(group.average_duration_seconds)}`);
+    lines.push(
+      `- ${group.skill} [${group.status}] runs=${group.run_count} active=${formatOptionalDuration(group.average_active_duration_seconds)} wall=${formatDuration(group.average_duration_seconds)}`,
+    );
   }
   return lines.join("\n");
 }
@@ -455,7 +457,7 @@ function formatCopilotSummaryBlockFromRuns(report: JsonRecord): string[] {
   }
   return report.groups.map(
     (group: JsonRecord) =>
-      `- ${group.skill} ${group.status}: ${group.run_count} runs, avg ${formatCompatDuration(group.average_duration_seconds)}, total ${formatCompatDuration(group.total_duration_seconds)}`,
+      `- ${group.skill} ${group.status}: ${group.run_count} runs, active ${formatOptionalCompatDuration(group.average_active_duration_seconds)}, wall avg ${formatCompatDuration(group.average_duration_seconds)}, wall total ${formatCompatDuration(group.total_duration_seconds)}`,
   );
 }
 
@@ -509,7 +511,9 @@ function formatSummaryBlockFromRuns(report: JsonRecord): string[] {
   const lines = [`- ${report.run_count} runs`];
   if (report.groups?.length) {
     const first = report.groups[0];
-    lines.push(`- ${first.skill} [${first.status}] x${first.run_count}`);
+    lines.push(
+      `- ${first.skill} [${first.status}] x${first.run_count} active ${formatOptionalDuration(first.average_active_duration_seconds)} wall ${formatDuration(first.average_duration_seconds)}`,
+    );
   }
   return lines;
 }
@@ -545,6 +549,10 @@ function formatDuration(seconds: number): string {
   return `${remainder}s`;
 }
 
+function formatOptionalDuration(seconds: any): string {
+  return typeof seconds === "number" ? formatDuration(seconds) : "n/a";
+}
+
 function formatCompatDuration(seconds: number): string {
   if (seconds < 60) {
     return `${seconds}s`;
@@ -557,6 +565,10 @@ function formatCompatDuration(seconds: number): string {
   const hours = Math.floor(minutes / 60);
   const minuteRemainder = minutes % 60;
   return minuteRemainder ? `${hours}h ${minuteRemainder}m` : `${hours}h`;
+}
+
+function formatOptionalCompatDuration(seconds: any): string {
+  return typeof seconds === "number" ? formatCompatDuration(seconds) : "n/a";
 }
 
 function formatCounterMap(values: JsonRecord): string {

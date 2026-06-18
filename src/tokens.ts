@@ -1,15 +1,19 @@
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 
+import {
+  codexSessionActiveTime,
+  codexSessionCandidatePaths,
+  latestCodexSessionTokenMetrics,
+  readCodexSessionSummaryAt,
+} from "./codex-session.js";
 import { SCHEMA_VERSION, defaultStatusForEvent, digest16, isPlainObject, parseIsoTimestamp, stableStringify } from "./events.js";
-import type { Client, RuntimeOptions, TokenMetrics } from "./types.js";
-import { expandHomePath, isDirectory, isFile, safePathMtime, safeReaddir } from "./utils.js";
+import type { Client, ClientSessionActiveTimeMetrics, RuntimeOptions, TokenMetrics } from "./types.js";
+import { expandHomePath, isFile } from "./utils.js";
 
 type JsonRecord = Record<string, any>;
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
-const CODEX_SESSION_MATCH_LIMIT = 8;
-const CODEX_SESSION_DAY_DIR_LIMIT = 8;
 
 export async function buildHookTokenEvent(primaryEvent: JsonRecord, options: RuntimeOptions): Promise<JsonRecord> {
   if (options.client && options.home) {
@@ -34,22 +38,48 @@ export async function loadClientSessionTokenMetrics(
   return loadCopilotSessionTokenMetrics(expandedHome, sessionId, timestamp);
 }
 
+export async function loadClientSessionActiveTime(
+  client: Client,
+  home: string,
+  sessionId: any,
+  startTimestamp: string | null,
+  endTimestamp: string | null,
+): Promise<ClientSessionActiveTimeMetrics | null> {
+  const expandedHome = expandHomePath(home);
+  if (client !== "codex") {
+    return null;
+  }
+  return loadCodexSessionActiveTime(expandedHome, sessionId, startTimestamp, endTimestamp);
+}
+
 async function loadCodexSessionTokenMetrics(home: string, sessionId: any, timestamp?: string): Promise<TokenMetrics | null> {
-  if (typeof sessionId !== "string" || !sessionId.trim()) {
-    return null;
-  }
-  const normalizedSessionId = sessionId.trim();
-  if (!SESSION_ID_PATTERN.test(normalizedSessionId)) {
-    return null;
-  }
-  const sessionsRoot = join(home, "sessions");
-  if (!isDirectory(sessionsRoot)) {
-    return null;
-  }
   const targetTimestamp = parseOptionalTargetTimestamp(timestamp);
-  const candidates = codexSessionCandidatePaths(sessionsRoot, normalizedSessionId, timestamp);
+  const candidates = codexSessionCandidatePaths(home, sessionId, timestamp);
   for (const candidate of candidates) {
-    const metrics = await readCodexSessionTokenMetricsAt(candidate, targetTimestamp);
+    const summary = await readCodexSessionSummaryAt(candidate);
+    const metrics = summary ? latestCodexSessionTokenMetrics(summary, targetTimestamp) : null;
+    if (metrics) {
+      return metrics;
+    }
+  }
+  return null;
+}
+
+async function loadCodexSessionActiveTime(
+  home: string,
+  sessionId: any,
+  startTimestamp: string | null,
+  endTimestamp: string | null,
+): Promise<ClientSessionActiveTimeMetrics | null> {
+  const start = parseOptionalTargetTimestamp(startTimestamp ?? undefined);
+  const end = parseOptionalTargetTimestamp(endTimestamp ?? undefined);
+  if (!start || !end || end < start) {
+    return null;
+  }
+  const candidates = codexSessionCandidatePaths(home, sessionId, startTimestamp ?? undefined);
+  for (const candidate of candidates) {
+    const summary = await readCodexSessionSummaryAt(candidate);
+    const metrics = summary ? codexSessionActiveTime(summary, start, end) : null;
     if (metrics) {
       return metrics;
     }
@@ -81,170 +111,6 @@ function parseOptionalTargetTimestamp(timestamp?: string): Date | null {
   } catch {
     return null;
   }
-}
-
-function codexSessionCandidatePaths(sessionsRoot: string, sessionId: string, timestamp?: string): string[] {
-  const seen = new Set<string>();
-  const candidates: string[] = [];
-  const addCandidate = (candidate: string) => {
-    if (seen.has(candidate) || !isFile(candidate)) {
-      return;
-    }
-    seen.add(candidate);
-    candidates.push(candidate);
-  };
-  addCandidate(join(sessionsRoot, `${sessionId}.jsonl`));
-  for (const searchDir of codexSessionSearchDirs(sessionsRoot, timestamp)) {
-    for (const entry of safeReaddir(searchDir)) {
-      const path = join(searchDir, entry);
-      if (entry.endsWith(".jsonl") && codexSessionFileMatches(path, sessionId)) {
-        addCandidate(path);
-      }
-    }
-  }
-  return candidates.sort((left, right) => safePathMtime(right) - safePathMtime(left)).slice(0, CODEX_SESSION_MATCH_LIMIT);
-}
-
-function codexSessionSearchDirs(sessionsRoot: string, timestamp?: string): string[] {
-  const searchDirs: string[] = [];
-  const seen = new Set<string>();
-  const addDir = (path: string) => {
-    if (seen.has(path) || !isDirectory(path)) {
-      return;
-    }
-    seen.add(path);
-    searchDirs.push(path);
-  };
-  if (timestamp) {
-    try {
-      const parsed = parseIsoTimestamp(timestamp);
-      addDir(join(sessionsRoot, String(parsed.getUTCFullYear()).padStart(4, "0"), String(parsed.getUTCMonth() + 1).padStart(2, "0"), String(parsed.getUTCDate()).padStart(2, "0")));
-    } catch {
-      // Ignore malformed hook timestamps for fallback search.
-    }
-  }
-  for (const dayDir of listCodexSessionDayDirs(sessionsRoot).sort((left, right) => safePathMtime(right) - safePathMtime(left))) {
-    if (searchDirs.length >= CODEX_SESSION_DAY_DIR_LIMIT) {
-      break;
-    }
-    addDir(dayDir);
-  }
-  return searchDirs;
-}
-
-function listCodexSessionDayDirs(sessionsRoot: string): string[] {
-  const dayDirs: string[] = [];
-  for (const year of safeReaddir(sessionsRoot)) {
-    const yearDir = join(sessionsRoot, year);
-    if (!isDirectory(yearDir)) {
-      continue;
-    }
-    for (const month of safeReaddir(yearDir)) {
-      const monthDir = join(yearDir, month);
-      if (!isDirectory(monthDir)) {
-        continue;
-      }
-      for (const day of safeReaddir(monthDir)) {
-        const dayDir = join(monthDir, day);
-        if (isDirectory(dayDir)) {
-          dayDirs.push(dayDir);
-        }
-      }
-    }
-  }
-  return dayDirs;
-}
-
-function codexSessionFileMatches(path: string, sessionId: string): boolean {
-  const stem = basename(path).replace(/\.jsonl$/, "");
-  return stem === sessionId || stem.endsWith(`-${sessionId}`);
-}
-
-async function readCodexSessionTokenMetricsAt(path: string, targetTimestamp: Date | null): Promise<TokenMetrics | null> {
-  let latestMetrics: TokenMetrics | null = null;
-  let latestMatchingMetrics: TokenMetrics | null = null;
-  let text: string;
-  try {
-    text = await readFile(path, "utf8");
-  } catch {
-    return null;
-  }
-  for (const line of text.split(/\r?\n/)) {
-    const record = codexSessionLineTokenRecord(line);
-    if (!record) {
-      continue;
-    }
-    latestMetrics = record.metrics;
-    if (!targetTimestamp || !record.timestamp || record.timestamp <= targetTimestamp) {
-      latestMatchingMetrics = record.metrics;
-    }
-  }
-  return latestMatchingMetrics ?? latestMetrics;
-}
-
-function codexSessionLineTokenRecord(line: string): { timestamp: Date | null; metrics: TokenMetrics } | null {
-  let row: any;
-  try {
-    row = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!isPlainObject(row) || row.type !== "event_msg") {
-    return null;
-  }
-  const payload = row.payload;
-  if (!isPlainObject(payload) || payload.type !== "token_count") {
-    return null;
-  }
-  const info = payload.info;
-  if (!isPlainObject(info) || !isPlainObject(info.last_token_usage)) {
-    return null;
-  }
-  const metrics = codexUsageTokenMetrics(info.last_token_usage, info);
-  if (!metrics) {
-    return null;
-  }
-  let timestamp: Date | null = null;
-  if (typeof row.timestamp === "string") {
-    try {
-      timestamp = parseIsoTimestamp(row.timestamp);
-    } catch {
-      timestamp = null;
-    }
-  }
-  return { timestamp, metrics };
-}
-
-function codexUsageTokenMetrics(usage: JsonRecord, info: JsonRecord): TokenMetrics | null {
-  const inputTokens = optionalTokenInt(usage.input_tokens);
-  const outputTokens = optionalTokenInt(usage.output_tokens);
-  let totalTokens = optionalTokenInt(usage.total_tokens);
-  const cacheReadTokens = firstTokenInt(usage, "cache_read_tokens", "cached_input_tokens");
-  const cacheWriteTokens = firstTokenInt(usage, "cache_write_tokens", "cache_creation_input_tokens");
-  if (inputTokens === null && outputTokens === null && totalTokens === null) {
-    return null;
-  }
-  if (totalTokens === null) {
-    totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
-  }
-  const metrics: TokenMetrics = {
-    token_source: "exact",
-    attribution_scope: "turn",
-    input_tokens: inputTokens ?? 0,
-    output_tokens: outputTokens ?? 0,
-    total_tokens: totalTokens,
-    cache_read_tokens: cacheReadTokens ?? 0,
-    cache_write_tokens: cacheWriteTokens ?? 0,
-  };
-  const aiCredits = optionalMetricNumber(usage.ai_credits);
-  if (aiCredits !== null) {
-    metrics.ai_credits = aiCredits;
-  }
-  const model = usage.model ?? info.model;
-  if (typeof model === "string" && model.trim()) {
-    metrics.model = model;
-  }
-  return metrics;
 }
 
 async function readCopilotSessionTokenMetricsAt(path: string, targetTimestamp: Date | null): Promise<TokenMetrics | null> {

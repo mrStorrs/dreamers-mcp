@@ -3,6 +3,8 @@ export type ReportCommand = "runs" | "reviews" | "validation" | "gates" | "token
 export type StatsSource = "hook" | "skill" | "summary";
 export type TokenSourceQuality = "exact" | "estimated" | "unavailable";
 export type TokenAttributionScope = "turn" | "session";
+export type ActiveDurationQuality = "observed" | "unavailable";
+export type ActiveDurationSource = "codex_session_tasks";
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -432,6 +434,13 @@ export interface TokenMetrics {
   model?: string;
 }
 
+export interface ClientSessionActiveTimeMetrics {
+  active_duration_seconds: number;
+  active_turn_count: number;
+  active_duration_quality: "observed";
+  active_duration_source: ActiveDurationSource;
+}
+
 export interface ReportFilters {
   repo: "current" | "all";
   skill: string | null;
@@ -529,6 +538,9 @@ export interface RunGroup {
   run_count: number;
   total_duration_seconds: number;
   average_duration_seconds: number;
+  active_run_count: number;
+  total_active_duration_seconds: number | null;
+  average_active_duration_seconds: number | null;
   first_timestamp: string | null;
   last_timestamp: string | null;
 }
@@ -540,6 +552,10 @@ export interface RunReportItem {
   status: string;
   data_quality: "confirmed_closed";
   duration_seconds: number;
+  active_duration_seconds: number | null;
+  active_turn_count: number;
+  active_duration_quality: ActiveDurationQuality;
+  active_duration_source: ActiveDurationSource | null;
   first_timestamp: string | null;
   last_timestamp: string | null;
   start_timestamp: string | null;

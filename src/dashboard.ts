@@ -124,6 +124,21 @@ function dashboardTokenMetric(tokens: JsonRecord): [any, string] {
   return [0, "exact total"];
 }
 
+function dashboardActiveTimeMetric(runs: JsonRecord): [any, string] {
+  let total = 0;
+  let activeRunCount = 0;
+  for (const group of runs.groups ?? []) {
+    if (typeof group.total_active_duration_seconds === "number") {
+      total += group.total_active_duration_seconds;
+      activeRunCount += Number(group.active_run_count ?? 0);
+    }
+  }
+  if (!activeRunCount) {
+    return ["n/a", "unavailable"];
+  }
+  return [formatDuration(total), `${activeRunCount} observed run${activeRunCount === 1 ? "" : "s"}`];
+}
+
 function htmlRunDetailSection(runs: JsonRecord): string {
   const runItems = runs.items ?? [];
   if (!runItems.length) {
@@ -155,12 +170,15 @@ function htmlRunDetailSection(runs: JsonRecord): string {
       `<span class="run-id">${htmlText(run.run_id)}</span>`,
       `<span>${htmlText(run.skill)}</span>`,
       htmlStatusBadge(run.status),
-      `<span>${htmlText(formatDuration(run.duration_seconds))}</span>`,
+      `<span>${htmlText(`active ${formatOptionalDuration(run.active_duration_seconds)} / wall ${formatDuration(run.duration_seconds)}`)}</span>`,
       "</summary>",
       '<div class="run-detail-body">',
       htmlDefinitionList([
         ["first seen", formatDashboardTimestamp(run.first_timestamp)],
         ["last seen", formatDashboardTimestamp(run.last_timestamp)],
+        ["active time", formatOptionalDuration(run.active_duration_seconds)],
+        ["active source", run.active_duration_source ?? run.active_duration_quality ?? "unavailable"],
+        ["wall time", formatDuration(run.duration_seconds)],
         ["validation attempts", validation.attempt_count],
         ["validation failures", validationFailures],
         ["gate decisions", gateCount],
@@ -229,6 +247,7 @@ export function renderDashboardHtml(
     htmlCount(group.skill),
     htmlStatusBadge(group.status),
     htmlCount(group.run_count),
+    htmlCount(formatOptionalDuration(group.average_active_duration_seconds)),
     htmlCount(formatDuration(group.average_duration_seconds)),
     htmlCount(formatDashboardTimestamp(group.last_timestamp)),
   ]);
@@ -259,6 +278,7 @@ export function renderDashboardHtml(
     ]);
   });
   const [tokenMetricValue, tokenMetricDetail] = dashboardTokenMetric(tokens);
+  const [activeMetricValue, activeMetricDetail] = dashboardActiveTimeMetric(runs);
   const validationFailures = Object.values(validation.command_kinds).reduce((sum: number, summary: any) => sum + Number(summary.failure_count), 0);
   const validationFinalFailures = Object.values(validation.command_kinds).reduce((sum: number, summary: any) => sum + Number(summary.final_fail_count), 0);
 
@@ -295,13 +315,14 @@ export function renderDashboardHtml(
     warningHtml,
     '<section class="metrics">',
     htmlMetricCard("Runs", runs.run_count, "reliable skill invocations"),
+    htmlMetricCard("Active time", activeMetricValue, activeMetricDetail),
     htmlMetricCard("Validation", validation.attempt_count, `${validationFailures} failed, ${validationFinalFailures} final failures`),
     htmlMetricCard("Reviews", reviews.review_count, `${reviews.blocked_count} blocked, ${reviews.open_question_count} open questions`),
     htmlMetricCard("Gates", Object.values(gates.gate_type_counts).reduce((sum: number, value: any) => sum + Number(value), 0), `${Object.keys(gates.gate_type_counts).length} gate types`),
     htmlMetricCard("Tokens", tokenMetricValue, tokenMetricDetail),
     "</section>",
     '<section class="panel"><h2>Runs by skill</h2>',
-    htmlTable(["Skill", "Status", "Runs", "Avg duration", "Last seen"], runRows, "no runs matched these filters"),
+    htmlTable(["Skill", "Status", "Runs", "Avg active", "Avg wall time", "Last seen"], runRows, "no runs matched these filters"),
     "</section>",
     htmlRunDetailSection(runs),
     htmlIncompleteRunSection(runs),
@@ -344,6 +365,10 @@ function formatDuration(seconds: number): string {
     return `${minutes}m${remainder}s`;
   }
   return `${remainder}s`;
+}
+
+function formatOptionalDuration(seconds: any): string {
+  return typeof seconds === "number" ? formatDuration(seconds) : "n/a";
 }
 
 function formatCounterMap(values: JsonRecord): string {
